@@ -43,6 +43,7 @@ function startStreaming() {
     console.log("Starting FFmpeg stream to YouTube...");
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1',
+        '-framerate', '2',            // 1. Διαβάζει την εικόνα ΜΟΝΟ 2 φορές το δευτερόλεπτο (τεράστια οικονομία CPU)
         '-i', 'background.jpg',
         '-f', 'concat',
         '-stream_loop', '-1',
@@ -51,12 +52,15 @@ function startStreaming() {
         '-map', '0:v:0',
         '-map', '1:a:0',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',       // 1. Μηδενίζει το ζόρι του επεξεργαστή
+        '-preset', 'ultrafast',
         '-tune', 'stillimage',
-        '-vf', 'scale=1280:720,fps=24', // 2. Ρίχνει την ανάλυση σε 720p HD για να τρέχει «νερό»
-        '-g', '48',                   // 3. Στέλνει σταθερά πακέτα εικόνας που ζητάει το YouTube
+        '-r', '15',                   // 2. Στέλνει 15 καρέ/δευτερόλεπτο στο YouTube αντιγράφοντας απλά την έτοιμη εικόνα σου
+        '-g', '30',                   // 3. Σωστός χρονισμός πακέτων για το YouTube
+        '-b:v', '150k',               // 4. Χαμηλό bitrate βίντεο αφού η εικόνα είναι σταθερή
+        '-maxrate', '150k',
+        '-bufsize', '300k',
         '-c:a', 'aac',
-        '-b:a', '128k',               // 4. Ελαφρύ και καθαρό bitrate ήχου για να μην μπουκώνει
+        '-b:a', '128k',
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
