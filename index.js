@@ -72,7 +72,7 @@ function selectNextFile() {
     if (time.hour === 0 && lastAnnouncedHour !== 0) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnnouncedHour = 0;
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση' };
+            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Εθνικός ύμνος' };
         }
     }
 
