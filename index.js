@@ -11,7 +11,7 @@ let songCounter = 0;
 let lastAnnouncedHour = -1; 
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System Premium v2.0 is Running!');
+    res.send('Thavma Παλμός Automation System Premium v2.1 is Running!');
 });
 
 app.listen(PORT, () => {
@@ -72,7 +72,7 @@ function selectNextFile() {
     if (time.hour === 0 && lastAnnouncedHour !== 0) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnnouncedHour = 0;
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ' };
+            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση' };
         }
     }
 
@@ -84,7 +84,7 @@ function selectNextFile() {
 
         if (fs.existsSync(path.join(__dirname, hourFileName))) {
             lastAnnouncedHour = time.hour;
-            return { file: hourFileName, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true };
+            return { file: hourFileName, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true, genreLabel: 'Ώρα Ελλάδος' };
         }
     }
 
@@ -92,7 +92,7 @@ function selectNextFile() {
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
-            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle' };
+            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού' };
         }
     }
 
@@ -108,35 +108,38 @@ function selectNextFile() {
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
+    let genreLabel = "Mix Πρόγραμμα";
 
     if (genre === 'B') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(B)'));
+        genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(R)'));
+        genreLabel = "Radio (Κανονική Ροή)";
     } else if (genre === 'P_LZ') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
+        genreLabel = "Παραδοσιακά & Λαϊκά";
     } else if (genre === 'MIX_PREFER_P') {
-        // Σαββατοκύριακο: 70% πιθανότητα να διαλέξει Παραδοσιακό, 30% οτιδήποτε άλλο
         let pFiles = mp3Files.filter(f => f.startsWith('(Π)'));
         if (pFiles.length > 0 && Math.random() < 0.7) {
             filteredFiles = pFiles;
         } else {
             filteredFiles = mp3Files;
         }
+        genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
     }
 
-    // Αν δεν βρει τραγούδι της συγκεκριμένης κατηγορίας, παίρνει από τα διαθέσιμα για να μην κολλήσει
     if (filteredFiles.length === 0) {
         filteredFiles = mp3Files;
     }
 
     const randomFile = filteredFiles[Math.floor(Math.random() * filteredFiles.length)];
     
-    // Καθαρισμός του τίτλου από τα (Π), (Β) και το .mp3 για να φαίνεται όμορφα στην οθόνη
+    // Καθαρισμός τίτλου
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
     songCounter++;
-    return { file: randomFile, title: displayTitle };
+    return { file: randomFile, title: displayTitle, genreLabel: genreLabel };
 }
 
 function startNextMedia() {
@@ -154,9 +157,13 @@ function startNextMedia() {
         return;
     }
 
-    console.log(`[PLAYING]: ${media.title}`);
+    console.log(`[PLAYING]: [${media.genreLabel}] ${media.title}`);
 
-    // Ροή FFmpeg με εντολή drawtext για εμφάνιση του τίτλου ζωντανά στην οθόνη του YouTube
+    // Ασφαλής καθαρισμός αποστρόφων για να μην κρασάρει το FFmpeg drawtext
+    const cleanLabel = media.genreLabel.replace(/'/g, "’");
+    const cleanTitle = media.title.replace(/'/g, "’");
+
+    // Διπλό drawtext: Το πρώτο τυπώνει τη θεματολογία (κίτρινο) και το δεύτερο τον τίτλο (λευκό) πάνω αριστερά (x=40)
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1',
         '-framerate', '2',
@@ -168,8 +175,7 @@ function startNextMedia() {
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'stillimage',
-        // Σχεδίαση τίτλου στο κάτω μέρος της οθόνης με μαύρο ημιδιάφανο φόντο
-        '-vf', `drawtext=text='${media.title}':x=(w-text_w)/2:y=h-120:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=15`,
+        '-vf', `drawtext=text='${cleanLabel}':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${cleanTitle}':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12`,
         '-r', '15',
         '-g', '30',
         '-b:v', '150k',
@@ -184,7 +190,6 @@ function startNextMedia() {
     ]);
 
     ffmpeg.on('close', (code) => {
-        // Αν μόλις τελείωσε αναγγελία ώρας, επιβάλλουμε να παιχτεί ΑΜΕΣΩΣ το jingle
         if (media.isHourAnnouncement) {
             console.log("Hour announcement finished. Forcing immediate Jingle...");
             forceJingleNext();
@@ -194,7 +199,6 @@ function startNextMedia() {
     });
 }
 
-// Συνάρτηση που αναγκάζει το jingle να παίξει καπάκι μετά την ώρα
 function forceJingleNext() {
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
     if (!fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3')) || !streamKey) {
@@ -207,14 +211,14 @@ function forceJingleNext() {
         '-re', '-i', 'thavma_palmos_jingle.mp3',
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-        '-vf', "drawtext=text='Thavma Παλμός Jingle':x=(w-text_w)/2:y=h-120:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=15",
+        '-vf', "drawtext=text='Σήμα Σταθμού':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='Thavma Παλμός Jingle':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
         '-r', '15', '-g', '30', '-b:v', '150k', '-maxrate', '150k', '-bufsize', '300k',
         '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ]);
 
     ffmpeg.on('close', () => {
-        songCounter = 0; // Μηδενισμός του μετρητή αφού μόλις ακούστηκε jingle
+        songCounter = 0; 
         startNextMedia();
     });
 }
