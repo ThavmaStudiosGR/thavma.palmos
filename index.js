@@ -49,6 +49,8 @@ function startStreaming() {
         '-stream_loop', '-1',
         '-safe', '0',
         '-i', 'playlist.txt',
+        '-map', '0:v:0',  // Εξαναγκασμός: Πάρε βίντεο ΜΟΝΟ από το background.jpg (αγνοεί τα εξώφυλλα των MP3)
+        '-map', '1:a:0',  // Εξαναγκασμός: Πάρε ήχο ΜΟΝΟ από τα κομμάτια της λίστας
         '-c:v', 'libx264',
         '-tune', 'stillimage',
         '-c:a', 'aac',
@@ -57,6 +59,11 @@ function startStreaming() {
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ]);
+
+    // Εμφάνιση των πραγματικών μηνυμάτων και λαθών του FFmpeg στα logs του Render
+    ffmpeg.stderr.on('data', (data) => {
+        console.log(`FFmpeg: ${data.toString().trim()}`);
+    });
 
     ffmpeg.on('close', (code) => {
         console.log(`Stream disconnected (Code ${code}). Restarting in 5 seconds...`);
