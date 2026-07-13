@@ -45,6 +45,7 @@ function startStreaming() {
         '-loop', '1',
         '-framerate', '2',
         '-i', 'background.jpg',
+        '-re',                        // ΑΥΤΟ ΕΔΩ ΑΝΑΓΚΑΖΕΙ ΤΟΝ Server ΝΑ ΠΑΙΖΕΙ ΣΕ ΠΡΑΓΜΑΤΙΚΟ ΧΡΟΝΟ
         '-f', 'concat',
         '-stream_loop', '-1',
         '-safe', '0',
@@ -61,7 +62,7 @@ function startStreaming() {
         '-bufsize', '300k',
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-af', 'aresample=async=1', // ΑΥΤΟ ΕΔΩ ΔΙΟΡΘΩΝΕΙ ΤΑ ΠΗΔΗΜΑΤΑ ΣΤΟΝ ΗΧΟ
+        '-af', 'aresample=async=1',
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
