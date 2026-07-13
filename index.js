@@ -5,13 +5,20 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Μετρητής για το jingle ανά 5 τραγούδια
 let songCounter = 0;
-// Κρατάει την τελευταία ώρα που ανακοινώθηκε για να μην διπλοπαίζει στο ίδιο ωριαίο slot
 let lastAnnouncedHour = -1; 
 
+// Μεταβλητή που κρατάει το τρέχον τραγούδι για να το στέλνει στο site σου
+let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
+
+// API Endpoint για την ιστοσελίδα σου (Επιτρέπει στο site να τραβάει τα δεδομένα)
+app.get('/api/now-playing', (req, res) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.json(currentNowPlaying);
+});
+
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System Premium v2.3 is Running!');
+    res.send('Thavma Παλμός Automation System v3.0 (Stable) is Running!');
 });
 
 app.listen(PORT, () => {
@@ -19,64 +26,57 @@ app.listen(PORT, () => {
     startNextMedia();
 });
 
-// Λήψη Ώρας Ελλάδος (Υπολογίζει αυτόματα θερινή/χειμερινή ώρα)
 function getGreekTime() {
     const date = new Date();
     const greekString = date.toLocaleString("en-US", {timeZone: "Europe/Athens"});
     const greekDate = new Date(greekString);
     return {
-        day: greekDate.getDay(), // 0 = Κυριακή, 1 = Δευτέρα... 6 = Σάββατο
+        day: greekDate.getDay(),
         hour: greekDate.getHours(),
         minute: greekDate.getMinutes()
     };
 }
 
-// Λήψη του σωστού είδους μουσικής βάσει του προγράμματός σου
 function getRequiredGenre() {
     const time = getGreekTime();
     const d = time.day;
     const h = time.hour;
 
-    // Σαββατοκύριακο (0 = Κυριακή, 6 = Σάββατο)
     if (d === 0 || d === 6) {
         if ((h >= 12 && h < 16) || (h >= 20 && h < 24)) return 'MIX_PREFER_P';
         return 'MIX';
     }
 
-    // Δευτέρα (1), Τετάρτη (3), Παρασκευή (5)
     if (d === 1 || d === 3 || d === 5) {
         if (h >= 2 && h < 7) return 'B';
         if (h >= 7 && h < 12) return 'R';
         if (h >= 12 && h < 17) return 'P_LZ';
         if (h >= 17 && h < 20) return 'R';
-        return 'MIX'; // 20:00 - 02:00
+        return 'MIX'; 
     }
 
-    // Τρίτη (2), Πέμπτη (4)
     if (d === 2 || d === 4) {
         if (h >= 0 && h < 8) return 'B';
         if (h >= 8 && h < 12) return 'R';
         if (h >= 12 && h < 16) return 'P_LZ';
         if (h >= 16 && h < 20) return 'R';
-        return 'MIX'; // 20:00 - 00:00
+        return 'MIX'; 
     }
 
     return 'MIX';
 }
 
-// Διάλεξε το επόμενο αρχείο ήχου που πρέπει να παίξει
 function selectNextFile() {
     const time = getGreekTime();
     
-    // 1. Έλεγχος για Εθνικό Ύμνο (Μεσάνυχτα 00:00)
     if (time.hour === 0 && lastAnnouncedHour !== 0) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnnouncedHour = 0;
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Εθνικός ύμνος' };
+            currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
+            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση' };
         }
     }
 
-    // 2. Έλεγχος για Αναγγελία Ώρας (Κάθε ακριβώς)
     if (lastAnnouncedHour !== time.hour) {
         let fileHour = time.hour % 12;
         let altHour = fileHour + 12;
@@ -84,19 +84,19 @@ function selectNextFile() {
 
         if (fs.existsSync(path.join(__dirname, hourFileName))) {
             lastAnnouncedHour = time.hour;
+            currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
             return { file: hourFileName, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true, genreLabel: 'Ώρα Ελλάδος' };
         }
     }
 
-    // 3. Έλεγχος για Jingle ανά 5 τραγούδια
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
+            currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
             return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού' };
         }
     }
 
-    // 4. Φιλτράρισμα και επιλογή κανονικού τραγουδιού
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' 
         && !file.includes(' - ') 
@@ -134,11 +134,13 @@ function selectNextFile() {
     }
 
     const randomFile = filteredFiles[Math.floor(Math.random() * filteredFiles.length)];
-    
-    // Καθαρισμός τίτλου
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
     songCounter++;
+    
+    // Ανανεώνει τα δεδομένα για το site σου
+    currentNowPlaying = { title: displayTitle, genre: genreLabel };
+    
     return { file: randomFile, title: displayTitle, genreLabel: genreLabel };
 }
 
@@ -146,43 +148,32 @@ function startNextMedia() {
     const media = selectNextFile();
     
     if (!media) {
-        console.error("No audio files found! Retrying in 5 seconds...");
         setTimeout(startNextMedia, 5000);
         return;
     }
 
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
-    if (!streamKey) {
-        console.error("YOUTUBE_STREAM_KEY is missing!");
-        return;
-    }
+    if (!streamKey) return;
 
-    console.log(`[PLAYING]: [${media.genreLabel}] ${media.title}`);
-
-    // Ασφαλής καθαρισμός αποστρόφων
     const cleanLabel = media.genreLabel.replace(/'/g, "’");
     const cleanTitle = media.title.replace(/'/g, "’");
 
-    // Σούπερ ελαφριά ροή FFmpeg στα 720p και 10fps για ελαχιστοποίηση χρήσης CPU
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1',
-        '-framerate', '5', // Διαβάζει την εικόνα πολύ αργά (σώζει CPU)
+        '-framerate', '10', 
         '-i', 'background.jpg',
         '-re',
         '-i', media.file,
         '-map', '0:v:0',
         '-map', '1:a:0',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
+        '-preset', 'veryfast', 
         '-tune', 'stillimage',
-        '-threads', '1',
-        // scale=1280:720 κάνει την εικόνα 720p HD. Οι τίτλοι προσαρμόζονται τέλεια στα νέα μεγέθη.
+        '-threads', '2', 
         '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
-        '-r', '10', // 10 fps output
-        '-g', '20', // keyframe interval
-        '-b:v', '100k', // πολύ χαμηλό bitrate βίντεο (στατική εικόνα είναι)
-        '-maxrate', '100k',
-        '-bufsize', '200k',
+        '-b:v', '400k', // Σταματάει το θόλωμα
+        '-maxrate', '400k',
+        '-bufsize', '800k', // Σταθεροποιεί τη ροή
         '-c:a', 'aac',
         '-b:a', '128k',
         '-shortest',
@@ -192,9 +183,7 @@ function startNextMedia() {
     ]);
 
     ffmpeg.on('close', (code) => {
-        console.log(`[FFMPEG EXITED] with code ${code}`);
         if (media.isHourAnnouncement) {
-            console.log("Hour announcement finished. Forcing immediate Jingle...");
             forceJingleNext();
         } else {
             startNextMedia();
@@ -208,21 +197,34 @@ function forceJingleNext() {
         startNextMedia();
         return;
     }
+    
+    currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
 
     const ffmpeg = spawn('ffmpeg', [
-        '-loop', '1', '-framerate', '5', '-i', 'background.jpg',
-        '-re', '-i', 'thavma_palmos_jingle.mp3',
-        '-map', '0:v:0', '-map', '1:a:0',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-        '-threads', '1',
+        '-loop', '1', 
+        '-framerate', '10', 
+        '-i', 'background.jpg',
+        '-re', 
+        '-i', 'thavma_palmos_jingle.mp3',
+        '-map', '0:v:0', 
+        '-map', '1:a:0',
+        '-c:v', 'libx264', 
+        '-preset', 'veryfast', 
+        '-tune', 'stillimage',
+        '-threads', '2',
         '-vf', "scale=1280:720,drawtext=text='Σήμα Σταθμού':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='Thavma Παλμός Jingle':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10",
-        '-r', '10', '-g', '20', '-b:v', '100k', '-maxrate', '100k', '-bufsize', '200k',
-        '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
+        '-b:v', '400k', 
+        '-maxrate', '400k', 
+        '-bufsize', '800k',
+        '-c:a', 'aac', 
+        '-b:a', '128k', 
+        '-shortest', 
+        '-pix_fmt', 'yuv420p', 
+        '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ]);
 
-    ffmpeg.on('close', (code) => {
-        console.log(`[FFMPEG JINGLE EXITED] with code ${code}`);
+    ffmpeg.on('close', () => {
         songCounter = 0; 
         startNextMedia();
     });
