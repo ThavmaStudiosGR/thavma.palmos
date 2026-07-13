@@ -11,7 +11,7 @@ let songCounter = 0;
 let lastAnnouncedHour = -1; 
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System Premium v2.2 is Running!');
+    res.send('Thavma Παλμός Automation System Premium v2.3 is Running!');
 });
 
 app.listen(PORT, () => {
@@ -159,14 +159,14 @@ function startNextMedia() {
 
     console.log(`[PLAYING]: [${media.genreLabel}] ${media.title}`);
 
-    // Ασφαλής καθαρισμός αποστρόφων για να μην κρασάρει το FFmpeg drawtext
+    // Ασφαλής καθαρισμός αποστρόφων
     const cleanLabel = media.genreLabel.replace(/'/g, "’");
     const cleanTitle = media.title.replace(/'/g, "’");
 
-    // Διπλό drawtext πάνω αριστερά και προσθήκη του -threads 1 για ελαχιστοποίηση της CPU
+    // Σούπερ ελαφριά ροή FFmpeg στα 720p και 10fps για ελαχιστοποίηση χρήσης CPU
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1',
-        '-framerate', '2',
+        '-framerate', '5', // Διαβάζει την εικόνα πολύ αργά (σώζει CPU)
         '-i', 'background.jpg',
         '-re',
         '-i', media.file,
@@ -175,13 +175,14 @@ function startNextMedia() {
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'stillimage',
-        '-threads', '1', // <--- ΕΔΩ: Περιορίζει τη χρήση CPU για να μην κολλάει ο server!
-        '-vf', `drawtext=text='${cleanLabel}':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${cleanTitle}':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12`,
-        '-r', '15',
-        '-g', '30',
-        '-b:v', '150k',
-        '-maxrate', '150k',
-        '-bufsize', '300k',
+        '-threads', '1',
+        // scale=1280:720 κάνει την εικόνα 720p HD. Οι τίτλοι προσαρμόζονται τέλεια στα νέα μεγέθη.
+        '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
+        '-r', '10', // 10 fps output
+        '-g', '20', // keyframe interval
+        '-b:v', '100k', // πολύ χαμηλό bitrate βίντεο (στατική εικόνα είναι)
+        '-maxrate', '100k',
+        '-bufsize', '200k',
         '-c:a', 'aac',
         '-b:a', '128k',
         '-shortest',
@@ -191,6 +192,7 @@ function startNextMedia() {
     ]);
 
     ffmpeg.on('close', (code) => {
+        console.log(`[FFMPEG EXITED] with code ${code}`);
         if (media.isHourAnnouncement) {
             console.log("Hour announcement finished. Forcing immediate Jingle...");
             forceJingleNext();
@@ -208,18 +210,19 @@ function forceJingleNext() {
     }
 
     const ffmpeg = spawn('ffmpeg', [
-        '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
+        '-loop', '1', '-framerate', '5', '-i', 'background.jpg',
         '-re', '-i', 'thavma_palmos_jingle.mp3',
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-        '-threads', '1', // <--- Κι εδώ περιορισμός CPU
-        '-vf', "drawtext=text='Σήμα Σταθμού':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='Thavma Παλμός Jingle':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
-        '-r', '15', '-g', '30', '-b:v', '150k', '-maxrate', '150k', '-bufsize', '300k',
+        '-threads', '1',
+        '-vf', "scale=1280:720,drawtext=text='Σήμα Σταθμού':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='Thavma Παλμός Jingle':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10",
+        '-r', '10', '-g', '20', '-b:v', '100k', '-maxrate', '100k', '-bufsize', '200k',
         '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ]);
 
-    ffmpeg.on('close', () => {
+    ffmpeg.on('close', (code) => {
+        console.log(`[FFMPEG JINGLE EXITED] with code ${code}`);
         songCounter = 0; 
         startNextMedia();
     });
