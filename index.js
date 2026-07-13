@@ -24,7 +24,6 @@ function generatePlaylistAndStart() {
         return;
     }
 
-    // Ανακάτεμα τραγουδιών (Shuffle)
     mp3Files.sort(() => Math.random() - 0.5);
     console.log(`Found ${mp3Files.length} songs. Generating playlist...`);
 
@@ -49,18 +48,20 @@ function startStreaming() {
         '-stream_loop', '-1',
         '-safe', '0',
         '-i', 'playlist.txt',
-        '-map', '0:v:0',  // Εξαναγκασμός: Πάρε βίντεο ΜΟΝΟ από το background.jpg (αγνοεί τα εξώφυλλα των MP3)
-        '-map', '1:a:0',  // Εξαναγκασμός: Πάρε ήχο ΜΟΝΟ από τα κομμάτια της λίστας
+        '-map', '0:v:0',
+        '-map', '1:a:0',
         '-c:v', 'libx264',
+        '-preset', 'ultrafast',       // 1. Μηδενίζει το ζόρι του επεξεργαστή
         '-tune', 'stillimage',
+        '-vf', 'scale=1280:720,fps=24', // 2. Ρίχνει την ανάλυση σε 720p HD για να τρέχει «νερό»
+        '-g', '48',                   // 3. Στέλνει σταθερά πακέτα εικόνας που ζητάει το YouTube
         '-c:a', 'aac',
-        '-b:a', '192k',
+        '-b:a', '128k',               // 4. Ελαφρύ και καθαρό bitrate ήχου για να μην μπουκώνει
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ]);
 
-    // Εμφάνιση των πραγματικών μηνυμάτων και λαθών του FFmpeg στα logs του Render
     ffmpeg.stderr.on('data', (data) => {
         console.log(`FFmpeg: ${data.toString().trim()}`);
     });
