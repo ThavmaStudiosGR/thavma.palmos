@@ -11,7 +11,7 @@ let songCounter = 0;
 let lastAnnouncedHour = -1; 
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System Premium v2.1 is Running!');
+    res.send('Thavma Παλμός Automation System Premium v2.2 is Running!');
 });
 
 app.listen(PORT, () => {
@@ -163,7 +163,7 @@ function startNextMedia() {
     const cleanLabel = media.genreLabel.replace(/'/g, "’");
     const cleanTitle = media.title.replace(/'/g, "’");
 
-    // Διπλό drawtext: Το πρώτο τυπώνει τη θεματολογία (κίτρινο) και το δεύτερο τον τίτλο (λευκό) πάνω αριστερά (x=40)
+    // Διπλό drawtext πάνω αριστερά και προσθήκη του -threads 1 για ελαχιστοποίηση της CPU
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1',
         '-framerate', '2',
@@ -175,6 +175,7 @@ function startNextMedia() {
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'stillimage',
+        '-threads', '1', // <--- ΕΔΩ: Περιορίζει τη χρήση CPU για να μην κολλάει ο server!
         '-vf', `drawtext=text='${cleanLabel}':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${cleanTitle}':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12`,
         '-r', '15',
         '-g', '30',
@@ -211,6 +212,7 @@ function forceJingleNext() {
         '-re', '-i', 'thavma_palmos_jingle.mp3',
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
+        '-threads', '1', // <--- Κι εδώ περιορισμός CPU
         '-vf', "drawtext=text='Σήμα Σταθμού':x=40:y=40:fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='Thavma Παλμός Jingle':x=40:y=85:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
         '-r', '15', '-g', '30', '-b:v', '150k', '-maxrate', '150k', '-bufsize', '300k',
         '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
