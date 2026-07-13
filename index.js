@@ -8,17 +8,15 @@ const PORT = process.env.PORT || 3000;
 let songCounter = 0;
 let lastAnnouncedHour = -1; 
 
-// Μεταβλητή που κρατάει το τρέχον τραγούδι για να το στέλνει στο site σου
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
-// API Endpoint για την ιστοσελίδα σου (Επιτρέπει στο site να τραβάει τα δεδομένα)
 app.get('/api/now-playing', (req, res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.json(currentNowPlaying);
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v3.0 (Stable) is Running!');
+    res.send('Thavma Παλμός Automation System v3.1 (Stable & Smooth) is Running!');
 });
 
 app.listen(PORT, () => {
@@ -137,8 +135,6 @@ function selectNextFile() {
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
     songCounter++;
-    
-    // Ανανεώνει τα δεδομένα για το site σου
     currentNowPlaying = { title: displayTitle, genre: genreLabel };
     
     return { file: randomFile, title: displayTitle, genreLabel: genreLabel };
@@ -159,21 +155,23 @@ function startNextMedia() {
     const cleanTitle = media.title.replace(/'/g, "’");
 
     const ffmpeg = spawn('ffmpeg', [
-        '-loop', '1',
-        '-framerate', '10', 
-        '-i', 'background.jpg',
         '-re',
+        '-loop', '1',
+        '-framerate', '2', // Διαβάζει την εικόνα υπερ-αργά (Μηδενίζει την CPU)
+        '-i', 'background.jpg',
         '-i', media.file,
         '-map', '0:v:0',
         '-map', '1:a:0',
         '-c:v', 'libx264',
-        '-preset', 'veryfast', 
+        '-preset', 'ultrafast', // Ελαφρύτατο για τον server
         '-tune', 'stillimage',
-        '-threads', '2', 
+        '-threads', '1', 
         '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
+        '-r', '15', // Το YouTube θέλει σταθερά καρέ, τα 15 είναι ιδανικά
+        '-g', '30', // <--- SOS: Το μαγικό κλειδί. Keyframe κάθε 2 δευτερόλεπτα (15x2). Αυτό λύνει τα κολλήματα!
         '-b:v', '400k', // Σταματάει το θόλωμα
         '-maxrate', '400k',
-        '-bufsize', '800k', // Σταθεροποιεί τη ροή
+        '-bufsize', '800k', 
         '-c:a', 'aac',
         '-b:a', '128k',
         '-shortest',
@@ -201,18 +199,20 @@ function forceJingleNext() {
     currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
 
     const ffmpeg = spawn('ffmpeg', [
+        '-re',
         '-loop', '1', 
-        '-framerate', '10', 
+        '-framerate', '2', 
         '-i', 'background.jpg',
-        '-re', 
         '-i', 'thavma_palmos_jingle.mp3',
         '-map', '0:v:0', 
         '-map', '1:a:0',
         '-c:v', 'libx264', 
-        '-preset', 'veryfast', 
+        '-preset', 'ultrafast', 
         '-tune', 'stillimage',
-        '-threads', '2',
+        '-threads', '1',
         '-vf', "scale=1280:720,drawtext=text='Σήμα Σταθμού':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='Thavma Παλμός Jingle':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10",
+        '-r', '15', 
+        '-g', '30', // <--- Επίσης Keyframe κάθε 2 δευτερόλεπτα
         '-b:v', '400k', 
         '-maxrate', '400k', 
         '-bufsize', '800k',
