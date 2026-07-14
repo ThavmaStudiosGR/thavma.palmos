@@ -5,8 +5,10 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Αρχικό κλείδωμα της ώρας και της ημέρας κατά την εκκίνηση του server
+let lastAnnouncedHour = getGreekTime().hour; 
+let lastAnthemDate = getGreekTime().date; 
 let songCounter = 0;
-let lastAnnouncedHour = -1; 
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
 // API για την ιστοσελίδα
@@ -16,7 +18,7 @@ app.get('/api/now-playing', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v4.2 (CPU Optimized) is Running!');
+    res.send('Thavma Παλμός Automation System v4.3 (Robust Time Engine) is Running!');
 });
 
 app.listen(PORT, () => {
@@ -29,10 +31,61 @@ function getGreekTime() {
     const greekString = date.toLocaleString("en-US", {timeZone: "Europe/Athens"});
     const greekDate = new Date(greekString);
     return {
-        day: greekDate.getDay(),
-        hour: greekDate.getHours(),
+        day: greekDate.getDay(),     // 0-6 (Κυριακή-Σάββατο)
+        date: greekDate.getDate(),   // 1-31 (Ημέρα μήνα)
+        hour: greekDate.getHours(),  // 0-23
         minute: greekDate.getMinutes()
     };
+}
+
+// Έξυπνη εύρεση αρχείου ώρας ανεξάρτητα από τον τρόπο γραφής του ονόματος
+function findHourFile(hour) {
+    const files = fs.readdirSync(__dirname);
+    const fileHour = hour % 12;
+    const altHour = fileHour + 12;
+
+    for (let file of files) {
+        if (path.extname(file).toLowerCase() !== '.mp3') continue;
+        
+        const nameWithoutExt = path.basename(file, '.mp3').trim();
+        const numbers = nameWithoutExt.match(/\d+/g);
+        if (!numbers) continue;
+
+        const parsedNums = numbers.map(Number);
+
+        // Αν το αρχείο έχει δύο αριθμούς (π.χ. "4 - 16", "4-16" ή "16-4")
+        if (parsedNums.length >= 2) {
+            if (parsedNums.includes(fileHour) && parsedNums.includes(altHour)) {
+                return file;
+            }
+        }
+        // Αν το αρχείο έχει έναν αριθμό και είναι ακριβώς η 24ωρη ώρα (π.e. "16.mp3")
+        else if (parsedNums.length === 1) {
+            if (parsedNums[0] === hour) {
+                return file;
+            }
+        }
+    }
+    return null;
+}
+
+// Έλεγχος αν ένα αρχείο είναι αρχείο ώρας για να μην μπει κατά λάθος στη λίστα των τραγουδιών
+function isHourFile(fileName) {
+    if (fileName === 'thavma_palmos_jingle.mp3' || fileName === 'ethnikos_ymnos.mp3') return true;
+    
+    const nameWithoutExt = path.basename(fileName, '.mp3').trim();
+    const numbers = nameWithoutExt.match(/\d+/g);
+    if (!numbers) return false;
+    
+    const parsedNums = numbers.map(Number);
+    if (parsedNums.length >= 2) {
+        if (Math.abs(parsedNums[0] - parsedNums[1]) === 12) return true;
+    }
+    if (parsedNums.length === 1) {
+        const num = parsedNums[0];
+        if (num >= 0 && num <= 23 && nameWithoutExt === String(num)) return true;
+    }
+    return false;
 }
 
 function getRequiredGenre() {
@@ -64,26 +117,26 @@ function getRequiredGenre() {
 function selectNextFile() {
     const time = getGreekTime();
     
-    if (time.hour === 0 && lastAnnouncedHour !== 0) {
+    // 1. Εθνικός Ύμνος ακριβώς στις 00:00 (Μία φορά την ημέρα)
+    if (time.hour === 0 && lastAnthemDate !== time.date) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
-            lastAnnouncedHour = 0;
+            lastAnthemDate = time.date; 
             currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
             return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση' };
         }
     }
 
+    // 2. Αναγγελία Ώρας (Μόλις αλλάξει η ώρα)
     if (lastAnnouncedHour !== time.hour) {
-        let fileHour = time.hour % 12;
-        let altHour = fileHour + 12;
-        let hourFileName = `${fileHour} - ${altHour}.mp3`;
-
-        if (fs.existsSync(path.join(__dirname, hourFileName))) {
+        const hourFile = findHourFile(time.hour);
+        if (hourFile) {
             lastAnnouncedHour = time.hour;
             currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
-            return { file: hourFileName, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true, genreLabel: 'Ώρα Ελλάδος' };
+            return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true, genreLabel: 'Ώρα Ελλάδος' };
         }
     }
 
+    // 3. Jingle ανά 5 τραγούδια
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
@@ -92,25 +145,24 @@ function selectNextFile() {
         }
     }
 
+    // 4. Επιλογή Τραγουδιού
     const files = fs.readdirSync(__dirname);
-    let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' 
-        && !file.includes(' - ') 
-        && file !== 'thavma_palmos_jingle.mp3' 
-        && file !== 'ethnikos_ymnos.mp3'
+    let mp3Files = files.filter(file => 
+        path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file)
     );
 
     if (mp3Files.length === 0) return null;
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
-    let genreLabel = "Mix";
+    let genreLabel = "Mix Πρόγραμμα";
 
     if (genre === 'B') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(B)'));
         genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(R)'));
-        genreLabel = "Radio";
+        genreLabel = "Radio (Κανονική Ροή)";
     } else if (genre === 'P_LZ') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
         genreLabel = "Παραδοσιακά & Λαϊκά";
@@ -118,7 +170,7 @@ function selectNextFile() {
         let pFiles = mp3Files.filter(f => f.startsWith('(Π)'));
         if (pFiles.length > 0 && Math.random() < 0.7) filteredFiles = pFiles;
         else filteredFiles = mp3Files;
-        genreLabel = "Mix";
+        genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
     }
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
@@ -150,9 +202,9 @@ function startNextMedia() {
     console.log(`[PLAYING]: ${media.title}`);
 
     const ffmpeg = spawn('ffmpeg', [
-        '-re',                 // ΕΠΑΝΑΦΟΡΑ ΚΟΦΤΗ: Διαβάζει σε πραγματικό χρόνο
+        '-re',
         '-loop', '1', 
-        '-framerate', '2',     // ΕΠΑΝΑΦΟΡΑ ΚΟΦΤΗ: Επεξεργάζεται μόνο 2 καρέ/δευτερόλεπτο για να μην κάψει τον server
+        '-framerate', '2',
         '-i', 'background.jpg',
         '-re', 
         '-i', media.file,
@@ -165,12 +217,12 @@ function startNextMedia() {
         '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
         '-r', '15', 
         '-g', '30', 
-        '-b:v', '2500k',       // Κρατάμε τα 2500k για να μην γκρινιάζει το YouTube
+        '-b:v', '2500k',       
         '-maxrate', '2500k',
         '-bufsize', '5000k',
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-shortest',           // Ακαριαία αλλαγή τραγουδιού
+        '-shortest',
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
