@@ -103,14 +103,14 @@ function selectNextFile() {
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
-    let genreLabel = "Mix Πρόγραμμα";
+    let genreLabel = "Mix";
 
     if (genre === 'B') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(B)'));
         genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(R)'));
-        genreLabel = "Radio (Κανονική Ροή)";
+        genreLabel = "Radio";
     } else if (genre === 'P_LZ') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
         genreLabel = "Παραδοσιακά & Λαϊκά";
@@ -118,7 +118,7 @@ function selectNextFile() {
         let pFiles = mp3Files.filter(f => f.startsWith('(Π)'));
         if (pFiles.length > 0 && Math.random() < 0.7) filteredFiles = pFiles;
         else filteredFiles = mp3Files;
-        genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
+        genreLabel = "Mix";
     }
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
