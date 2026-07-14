@@ -16,7 +16,7 @@ app.get('/api/now-playing', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v4.0 (Anti-Crash Version) is Running!');
+    res.send('Thavma Παλμός Automation System v4.1 (2500k Bitrate) is Running!');
 });
 
 app.listen(PORT, () => {
@@ -151,9 +151,9 @@ function startNextMedia() {
 
     const ffmpeg = spawn('ffmpeg', [
         '-loop', '1', 
-        '-i', 'background.jpg',  // Αφαιρέθηκε το -re από εδώ. Το διαβάζει 1 φορά.
+        '-i', 'background.jpg',
         '-re', 
-        '-i', media.file,        // Το -re ελέγχει πλέον ΜΟΝΟ την ταχύτητα του MP3
+        '-i', media.file,
         '-map', '0:v:0',
         '-map', '1:a:0',
         '-c:v', 'libx264',
@@ -163,17 +163,16 @@ function startNextMedia() {
         '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
         '-r', '15', 
         '-g', '30', 
-        '-b:v', '400k',
-        '-maxrate', '400k',
-        '-bufsize', '800k',
+        '-b:v', '2500k',       // ΕΔΩ ΗΤΑΝ ΤΟ ΠΡΟΒΛΗΜΑ: Το αλλάξαμε σε 2500k όπως ζήτησε το YouTube
+        '-maxrate', '2500k',   // 2500k
+        '-bufsize', '5000k',   // Αντίστοιχα μεγαλύτερο buffer για το YouTube
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-shortest', // Ακαριαία αλλαγή τραγουδιού!
+        '-shortest',
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ], {
-        // SOS: Αυτό εμποδίζει το Memory Crash του Render (δεν αποθηκεύει άχρηστα logs)
         stdio: 'ignore' 
     });
 
@@ -211,9 +210,9 @@ function forceJingleNext() {
         '-vf', "scale=1280:720,drawtext=text='Σήμα Σταθμού':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='Thavma Παλμός Jingle':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10",
         '-r', '15', 
         '-g', '30', 
-        '-b:v', '400k', 
-        '-maxrate', '400k', 
-        '-bufsize', '800k',
+        '-b:v', '2500k',       // 2500k
+        '-maxrate', '2500k',   // 2500k
+        '-bufsize', '5000k',   // 5000k
         '-c:a', 'aac', 
         '-b:a', '128k', 
         '-shortest', 
