@@ -16,7 +16,7 @@ app.get('/api/now-playing', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v4.1 (2500k Bitrate) is Running!');
+    res.send('Thavma Παλμός Automation System v4.2 (CPU Optimized) is Running!');
 });
 
 app.listen(PORT, () => {
@@ -150,7 +150,9 @@ function startNextMedia() {
     console.log(`[PLAYING]: ${media.title}`);
 
     const ffmpeg = spawn('ffmpeg', [
+        '-re',                 // ΕΠΑΝΑΦΟΡΑ ΚΟΦΤΗ: Διαβάζει σε πραγματικό χρόνο
         '-loop', '1', 
+        '-framerate', '2',     // ΕΠΑΝΑΦΟΡΑ ΚΟΦΤΗ: Επεξεργάζεται μόνο 2 καρέ/δευτερόλεπτο για να μην κάψει τον server
         '-i', 'background.jpg',
         '-re', 
         '-i', media.file,
@@ -163,12 +165,12 @@ function startNextMedia() {
         '-vf', `scale=1280:720,drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10`,
         '-r', '15', 
         '-g', '30', 
-        '-b:v', '2500k',       // ΕΔΩ ΗΤΑΝ ΤΟ ΠΡΟΒΛΗΜΑ: Το αλλάξαμε σε 2500k όπως ζήτησε το YouTube
-        '-maxrate', '2500k',   // 2500k
-        '-bufsize', '5000k',   // Αντίστοιχα μεγαλύτερο buffer για το YouTube
+        '-b:v', '2500k',       // Κρατάμε τα 2500k για να μην γκρινιάζει το YouTube
+        '-maxrate', '2500k',
+        '-bufsize', '5000k',
         '-c:a', 'aac',
         '-b:a', '128k',
-        '-shortest',
+        '-shortest',           // Ακαριαία αλλαγή τραγουδιού
         '-pix_fmt', 'yuv420p',
         '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
@@ -197,7 +199,9 @@ function forceJingleNext() {
     currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
 
     const ffmpeg = spawn('ffmpeg', [
+        '-re',
         '-loop', '1', 
+        '-framerate', '2',
         '-i', 'background.jpg',
         '-re', 
         '-i', 'thavma_palmos_jingle.mp3',
@@ -210,9 +214,9 @@ function forceJingleNext() {
         '-vf', "scale=1280:720,drawtext=text='Σήμα Σταθμού':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='Thavma Παλμός Jingle':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10",
         '-r', '15', 
         '-g', '30', 
-        '-b:v', '2500k',       // 2500k
-        '-maxrate', '2500k',   // 2500k
-        '-bufsize', '5000k',   // 5000k
+        '-b:v', '2500k',
+        '-maxrate', '2500k',
+        '-bufsize', '5000k',
         '-c:a', 'aac', 
         '-b:a', '128k', 
         '-shortest', 
