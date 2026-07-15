@@ -4,27 +4,15 @@ const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json());
 
 let lastAnnouncedHour = getGreekTime().hour; 
 let lastAnthemDate = getGreekTime().date; 
 let songCounter = 0;
+let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
-// Live πληροφορίες
-let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio", requester: null };
-
-// Ουρά παραγγελιών
-let requestQueue = [];
-
-// Μνήμη IP για Cooldown (30 λεπτά)
-const ipCooldowns = new Map();
-
-// Ιστορικό shuffle ανά κατηγορία
+// Ιστορικό για να μην επαναλαμβάνονται τα τραγούδια
 let playedSongs = {
     'B': [],
     'R': [],
@@ -33,94 +21,13 @@ let playedSongs = {
     'MIX': []
 };
 
-// API 1: Live πληροφορίες
 app.get('/api/now-playing', (req, res) => {
+    res.header("Access-Control-Allow-Origin", "*");
     res.json(currentNowPlaying);
 });
 
-// API 2: Δυναμική λίστα τραγουδιών για το site
-app.get('/api/songs', (req, res) => {
-    try {
-        const files = fs.readdirSync(__dirname);
-        const mp3Files = files.filter(f => 
-            path.extname(f).toLowerCase() === '.mp3' && !isHourFile(f)
-        );
-
-        const categorized = { B: [], R: [], P_LZ: [], MIX: [] };
-
-        mp3Files.forEach(file => {
-            const cleanTitle = file.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-            
-            if (file.startsWith('(B)')) {
-                categorized.B.push({ filename: file, title: cleanTitle });
-            } else if (file.startsWith('(R)')) {
-                categorized.R.push({ filename: file, title: cleanTitle });
-            } else if (file.startsWith('(Π)') || file.startsWith('(ΛΖ)')) {
-                categorized.P_LZ.push({ filename: file, title: cleanTitle });
-            } else {
-                categorized.MIX.push({ filename: file, title: cleanTitle });
-            }
-        });
-
-        res.json(categorized);
-    } catch (err) {
-        res.status(500).json({ error: "Αδυναμία ανάγνωσης τραγουδιών" });
-    }
-});
-
-// API 3: Λήψη Παραγγελιάς
-app.get('/api/request', (req, res) => {
-    const { song, name, bypass } = req.query;
-    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-
-    if (!song || !name) {
-        return res.status(400).json({ success: false, message: "Λείπει το τραγούδι ή το όνομα!" });
-    }
-
-    // Έλεγχος αν το αρχείο υπάρχει όντως στον server
-    const filePath = path.join(__dirname, song);
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ success: false, message: "Το τραγούδι δεν βρέθηκε στον server!" });
-    }
-
-    // Έλεγχος Bypass ("TPΠ" ή "TPP")
-    const isBypassed = (bypass === 'TPΠ' || bypass === 'TPP');
-
-    if (!isBypassed) {
-        const now = Date.now();
-        if (ipCooldowns.has(clientIp)) {
-            const lastRequestTime = ipCooldowns.get(clientIp);
-            const diffMinutes = (now - lastRequestTime) / 1000 / 60;
-            if (diffMinutes < 30) {
-                const remaining = Math.ceil(30 - diffMinutes);
-                return res.status(429).json({ 
-                    success: false, 
-                    message: `Έχεις ήδη κάνει παραγγελιά! Δοκίμασε ξανά σε ${remaining} λεπτά.` 
-                });
-            }
-        }
-        // Καταγραφή της ώρας για την IP
-        ipCooldowns.set(clientIp, now);
-    }
-
-    // Καθαρισμός ονόματος
-    const cleanRequester = name.replace(/[^a-zA-Z0-9α-ωΑ-ΩίϊΐόέύϋΰήώΉΏΈΌΎΊΆΈ\s]/g, '').substring(0, 20);
-    const cleanTitle = song.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-
-    // Προσθήκη στην ουρά
-    requestQueue.push({
-        file: song,
-        title: cleanTitle,
-        requesterName: cleanRequester,
-        genreLabel: "Παραγγελιά Ακροατή"
-    });
-
-    console.log(`[REQUEST ADDED]: ${cleanTitle} από τον/την ${cleanRequester}`);
-    res.json({ success: true, message: `Η παραγγελιά σου καταχωρήθηκε! Σε λίγο στον αέρα!` });
-});
-
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Interactive Engine v7.0 is Running!');
+    res.send('Thavma Παλμός Automation System v6.1 is Running!');
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -182,11 +89,11 @@ function getRequiredGenre() {
 function selectNextFile() {
     const time = getGreekTime();
     
-    // 1. Εθνικός Ύμνος στις 00:00
+    // 1. Εθνικός Ύμνος
     if (time.hour === 0 && lastAnthemDate !== time.date) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnthemDate = time.date; 
-            currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση", requester: null };
+            currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
             return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
     }
@@ -196,38 +103,21 @@ function selectNextFile() {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
             lastAnnouncedHour = time.hour;
-            currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος", requester: null };
+            currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
             return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
         }
     }
 
-    // 3. ΕΛΕΓΧΟΣ ΟΥΡΑΣ ΠΑΡΑΓΓΕΛΙΩΝ (Παίζει αμέσως!)
-    if (requestQueue.length > 0) {
-        const nextRequest = requestQueue.shift();
-        currentNowPlaying = { 
-            title: nextRequest.title, 
-            genre: nextRequest.genreLabel, 
-            requester: nextRequest.requesterName 
-        };
-        return { 
-            file: nextRequest.file, 
-            title: nextRequest.title, 
-            genreLabel: nextRequest.genreLabel, 
-            requesterName: nextRequest.requesterName,
-            isSong: true 
-        };
-    }
-
-    // 4. Jingle ανά 5 τραγούδια
+    // 3. Jingle ανά 5 τραγούδια
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
-            currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού", requester: null };
+            currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
             return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
         }
     }
 
-    // 5. Κανονικό Πρόγραμμα (Smart Shuffle)
+    // 4. Κανονικό Τραγούδι
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => 
         path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file)
@@ -260,6 +150,7 @@ function selectNextFile() {
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
 
+    // Έλεγχος μνήμης Shuffle
     if (!playedSongs[genre]) playedSongs[genre] = [];
     let availableFiles = filteredFiles.filter(f => !playedSongs[genre].includes(f));
 
@@ -280,7 +171,7 @@ function startNextMedia() {
     const media = selectNextFile();
     
     if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) {
-        console.log("Αναμονή για αρχεία...");
+        console.log("Λείπει το background. Ξαναδοκιμάζω σε 5 δευτερόλεπτα...");
         setTimeout(startNextMedia, 5000);
         return;
     }
@@ -291,29 +182,21 @@ function startNextMedia() {
         songCounter++;
     }
 
-    currentNowPlaying = { 
-        title: media.title, 
-        genre: media.genreLabel, 
-        requester: media.requesterName || null 
-    };
+    currentNowPlaying = { title: media.title, genre: media.genreLabel };
 
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
-    if (!streamKey) return;
+    if (!streamKey) {
+        console.error("Λείπει το YOUTUBE_STREAM_KEY!");
+        setTimeout(startNextMedia, 5000);
+        return;
+    }
 
     const cleanLabel = media.genreLabel.replace(/'/g, "’");
     const cleanTitle = media.title.replace(/'/g, "’");
-    const cleanRequester = media.requesterName ? media.requesterName.replace(/'/g, "’") : "";
 
     console.log(`[PLAYING]: ${media.title}`);
 
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
-
-    // Φίλτρα FFmpeg: Αν υπάρχει παραγγελιά, ζωγραφίζουμε έξτρα κείμενο κάτω αριστερά
-    let videoFilters = `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8`;
-
-    if (media.requesterName) {
-        videoFilters += `, drawtext=text='Αφιέρωση: ${cleanRequester}':x=30:y=h-70:fontsize=24:fontcolor=orange:box=1:boxcolor=black@0.6:boxborderw=8`;
-    }
 
     const ffmpeg = spawn('ffmpeg', [
         '-re',
@@ -328,7 +211,7 @@ function startNextMedia() {
         '-preset', 'ultrafast',
         '-tune', 'stillimage',
         '-threads', '1', 
-        '-vf', videoFilters,
+        '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8`,
         '-r', '15', 
         '-g', '30', 
         '-b:v', '2500k',       
@@ -345,7 +228,8 @@ function startNextMedia() {
     });
 
     ffmpeg.on('close', () => {
-        startNextMedia(); // Ακαριαία έναρξη χωρίς καθυστέρηση (αντίο buffering!)
+        // Τέλος η καθυστέρηση! Ξεκινάει αμέσως το επόμενο τραγούδι για να μην κοπεί η ροή στο YT
+        startNextMedia(); 
     });
 
     ffmpeg.on('error', (err) => {
