@@ -1,4 +1,9 @@
-'hello'
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Thavma Stream is alive!');
+});
+server.listen(10000);
 
 process.env.TZ = 'Europe/Athens';
 
