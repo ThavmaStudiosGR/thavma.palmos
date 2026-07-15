@@ -1,3 +1,5 @@
+'hello'
+
 process.env.TZ = 'Europe/Athens';
 
 const express = require('express');
@@ -25,6 +27,7 @@ app.get('/api/now-playing', (req, res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.json(currentNowPlaying);
 });
+
 
 app.get('/', (req, res) => {
     res.send('Thavma Παλμός Automation System v6.1 is Running!');
