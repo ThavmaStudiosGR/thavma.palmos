@@ -27,10 +27,9 @@ app.get('/api/now-playing', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v6.0 (Rescue Edition) is Running!');
+    res.send('Thavma Παλμός Automation System v6.1 is Running!');
 });
 
-// ΣΗΜΑΝΤΙΚΟ: Ακούμε στην 0.0.0.0 για να μην μας κόβει το Render
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is listening on port ${PORT}`);
     startNextMedia();
@@ -177,9 +176,8 @@ function startNextMedia() {
         return;
     }
 
-    // Διαχείριση Jingle μετά από ώρα
     if (media.isHourAnnouncement) {
-        songCounter = 0; // Μηδενίζουμε για να μην παίξει Jingle μετά το ρολόι
+        songCounter = 0; 
     } else if (media.isSong) {
         songCounter++;
     }
@@ -198,10 +196,8 @@ function startNextMedia() {
 
     console.log(`[PLAYING]: ${media.title}`);
 
-    // Ρολόι μορφής: hh:mm:ss & dd/mm/yyyy
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
 
-    // Αφαιρέθηκαν τελείως οι εξωτερικές γραμματοσειρές από το drawtext
     const ffmpeg = spawn('ffmpeg', [
         '-re',
         '-loop', '1', 
@@ -231,14 +227,13 @@ function startNextMedia() {
         stdio: 'ignore' 
     });
 
-    ffmpeg.on('close', (code) => {
-        console.log(`FFmpeg έκλεισε. Ξεκινάω το επόμενο σε 3 δευτερόλεπτα...`);
-        // ΦΡΕΝΟ 3 δευτερολέπτων για να μην πέφτει σε άπειρη λούπα αν υπάρξει σφάλμα
-        setTimeout(startNextMedia, 3000); 
+    ffmpeg.on('close', () => {
+        // Τέλος η καθυστέρηση! Ξεκινάει αμέσως το επόμενο τραγούδι για να μην κοπεί η ροή στο YT
+        startNextMedia(); 
     });
 
     ffmpeg.on('error', (err) => {
         console.error('Σφάλμα FFmpeg:', err);
-        setTimeout(startNextMedia, 3000);
+        startNextMedia();
     });
 }
