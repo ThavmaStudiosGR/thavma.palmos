@@ -38,56 +38,22 @@ function getGreekTime() {
     };
 }
 
-// Έξυπνη εύρεση αρχείου ώρας ανεξάρτητα από τον τρόπο γραφής του ονόματος
 function findHourFile(hour) {
     const files = fs.readdirSync(__dirname);
-    const fileHour = hour % 12;
-    const altHour = fileHour + 12;
-
-    for (let file of files) {
-        if (path.extname(file).toLowerCase() !== '.mp3') continue;
-        
-        const nameWithoutExt = path.basename(file, '.mp3').trim();
-        const numbers = nameWithoutExt.match(/\d+/g);
-        if (!numbers) continue;
-
-        const parsedNums = numbers.map(Number);
-
-        // Αν το αρχείο έχει δύο αριθμούς (π.χ. "4 - 16", "4-16" ή "16-4")
-        if (parsedNums.length >= 2) {
-            if (parsedNums.includes(fileHour) && parsedNums.includes(altHour)) {
-                return file;
-            }
-        }
-        // Αν το αρχείο έχει έναν αριθμό και είναι ακριβώς η 24ωρη ώρα (π.e. "16.mp3")
-        else if (parsedNums.length === 1) {
-            if (parsedNums[0] === hour) {
-                return file;
-            }
-        }
+    // Ψάχνει ακριβώς για το αρχείο clockX.mp3 (π.χ. clock16.mp3 για τις 16:00)
+    const expectedFile = `clock${hour}.mp3`; 
+    
+    if (files.includes(expectedFile)) {
+        return expectedFile;
     }
     return null;
 }
 
-// Έλεγχος αν ένα αρχείο είναι αρχείο ώρας για να μην μπει κατά λάθος στη λίστα των τραγουδιών
 function isHourFile(fileName) {
     if (fileName === 'thavma_palmos_jingle.mp3' || fileName === 'ethnikos_ymnos.mp3') return true;
-    
-    const nameWithoutExt = path.basename(fileName, '.mp3').trim();
-    const numbers = nameWithoutExt.match(/\d+/g);
-    if (!numbers) return false;
-    
-    const parsedNums = numbers.map(Number);
-    if (parsedNums.length >= 2) {
-        if (Math.abs(parsedNums[0] - parsedNums[1]) === 12) return true;
-    }
-    if (parsedNums.length === 1) {
-        const num = parsedNums[0];
-        if (num >= 0 && num <= 23 && nameWithoutExt === String(num)) return true;
-    }
-    return false;
+    // Ελέγχει αν το όνομα ξεκινάει με "clock", έχει αριθμούς και τελειώνει σε ".mp3"
+    return /^clock\d+\.mp3$/.test(fileName);
 }
-
 function getRequiredGenre() {
     const time = getGreekTime();
     const d = time.day;
