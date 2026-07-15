@@ -1,4 +1,4 @@
-process.env.TZ = 'Europe/Athens'; // Επιβάλλει την ώρα Ελλάδος σε όλο τον server και στο FFmpeg
+process.env.TZ = 'Europe/Athens';
 
 const express = require('express');
 const { spawn } = require('child_process');
@@ -7,13 +7,12 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Αρχικό κλείδωμα της ώρας και της ημέρας κατά την εκκίνηση του server
 let lastAnnouncedHour = getGreekTime().hour; 
 let lastAnthemDate = getGreekTime().date; 
 let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
-// Έξυπνο "Shuffle" χωρίς επαναλήψεις - Ιστορικό ανά κατηγορία
+// Ιστορικό για να μην επαναλαμβάνονται τα τραγούδια
 let playedSongs = {
     'B': [],
     'R': [],
@@ -22,17 +21,17 @@ let playedSongs = {
     'MIX': []
 };
 
-// API για την ιστοσελίδα
 app.get('/api/now-playing', (req, res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.json(currentNowPlaying);
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v5.0 (Smart Queue & Live Clock) is Running!');
+    res.send('Thavma Παλμός Automation System v6.0 (Rescue Edition) is Running!');
 });
 
-app.listen(PORT, () => {
+// ΣΗΜΑΝΤΙΚΟ: Ακούμε στην 0.0.0.0 για να μην μας κόβει το Render
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is listening on port ${PORT}`);
     startNextMedia();
 });
@@ -42,18 +41,16 @@ function getGreekTime() {
     const greekString = date.toLocaleString("en-US", {timeZone: "Europe/Athens"});
     const greekDate = new Date(greekString);
     return {
-        day: greekDate.getDay(),     // 0-6 (Κυριακή-Σάββατο)
-        date: greekDate.getDate(),   // 1-31 (Ημέρα μήνα)
-        hour: greekDate.getHours(),  // 0-23
+        day: greekDate.getDay(),     
+        date: greekDate.getDate(),   
+        hour: greekDate.getHours(),  
         minute: greekDate.getMinutes()
     };
 }
 
 function findHourFile(hour) {
-    const files = fs.readdirSync(__dirname);
     const expectedFile = `clock${hour}.mp3`; 
-    
-    if (files.includes(expectedFile)) {
+    if (fs.existsSync(path.join(__dirname, expectedFile))) {
         return expectedFile;
     }
     return null;
@@ -93,22 +90,22 @@ function getRequiredGenre() {
 function selectNextFile() {
     const time = getGreekTime();
     
-    // 1. Εθνικός Ύμνος ακριβώς στις 00:00 (Μία φορά την ημέρα)
+    // 1. Εθνικός Ύμνος
     if (time.hour === 0 && lastAnthemDate !== time.date) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnthemDate = time.date; 
             currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση' };
+            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
     }
 
-    // 2. Αναγγελία Ώρας (Μόλις αλλάξει η ώρα)
+    // 2. Αναγγελία Ώρας
     if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
             lastAnnouncedHour = time.hour;
             currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
-            return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, isHourAnnouncement: true, genreLabel: 'Ώρα Ελλάδος' };
+            return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
         }
     }
 
@@ -117,11 +114,11 @@ function selectNextFile() {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
             currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
-            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού' };
+            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
         }
     }
 
-    // 4. Επιλογή Τραγουδιού
+    // 4. Κανονικό Τραγούδι
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => 
         path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file)
@@ -154,48 +151,57 @@ function selectNextFile() {
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
 
-    // Έξυπνο Queue (Shuffle χωρίς επαναλήψεις)
+    // Έλεγχος μνήμης Shuffle
     if (!playedSongs[genre]) playedSongs[genre] = [];
-    
-    // Φιλτράρουμε μόνο τα τραγούδια που ΔΕΝ έχουν παιχτεί ακόμα σε αυτή την κατηγορία
     let availableFiles = filteredFiles.filter(f => !playedSongs[genre].includes(f));
 
-    // Αν παίχτηκαν όλα, μηδενίζουμε το ιστορικό της κατηγορίας για να ξαναρχίσει ο κύκλος
     if (availableFiles.length === 0) {
         playedSongs[genre] = [];
         availableFiles = filteredFiles;
     }
 
     const randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
-    
-    // Προσθήκη στο ιστορικό
     playedSongs[genre].push(randomFile);
 
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
-    songCounter++;
-    currentNowPlaying = { title: displayTitle, genre: genreLabel };
-    
-    return { file: randomFile, title: displayTitle, genreLabel: genreLabel };
+    return { file: randomFile, title: displayTitle, genreLabel: genreLabel, isSong: true };
 }
 
 function startNextMedia() {
     const media = selectNextFile();
     
     if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) {
-        console.log("Λείπει αρχείο! Ξαναδοκιμάζω σε 5 δευτερόλεπτα...");
+        console.log("Λείπει το background. Ξαναδοκιμάζω σε 5 δευτερόλεπτα...");
         setTimeout(startNextMedia, 5000);
         return;
     }
 
+    // Διαχείριση Jingle μετά από ώρα
+    if (media.isHourAnnouncement) {
+        songCounter = 0; // Μηδενίζουμε για να μην παίξει Jingle μετά το ρολόι
+    } else if (media.isSong) {
+        songCounter++;
+    }
+
+    currentNowPlaying = { title: media.title, genre: media.genreLabel };
+
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
-    if (!streamKey) return;
+    if (!streamKey) {
+        console.error("Λείπει το YOUTUBE_STREAM_KEY!");
+        setTimeout(startNextMedia, 5000);
+        return;
+    }
 
     const cleanLabel = media.genreLabel.replace(/'/g, "’");
     const cleanTitle = media.title.replace(/'/g, "’");
 
     console.log(`[PLAYING]: ${media.title}`);
 
+    // Ρολόι μορφής: hh:mm:ss & dd/mm/yyyy
+    const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
+
+    // Αφαιρέθηκαν τελείως οι εξωτερικές γραμματοσειρές από το drawtext
     const ffmpeg = spawn('ffmpeg', [
         '-re',
         '-loop', '1', 
@@ -209,7 +215,7 @@ function startNextMedia() {
         '-preset', 'ultrafast',
         '-tune', 'stillimage',
         '-threads', '1', 
-        '-vf', `scale=1280:720, drawtext=fontfile=Century.ttf:text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=fontfile=CenturyGothic.ttf:text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=fontfile=CenturyGothic.ttf:text='%{localtime\\:%H\\\\:%M\\\\:%S & %d/%m/%Y}':x=w-tw-30:y=30:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8`,
+        '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8`,
         '-r', '15', 
         '-g', '30', 
         '-b:v', '2500k',       
@@ -225,12 +231,14 @@ function startNextMedia() {
         stdio: 'ignore' 
     });
 
-    ffmpeg.on('close', () => {
-        startNextMedia(); // Ξεκινάει απευθείας το επόμενο τραγούδι
+    ffmpeg.on('close', (code) => {
+        console.log(`FFmpeg έκλεισε. Ξεκινάω το επόμενο σε 3 δευτερόλεπτα...`);
+        // ΦΡΕΝΟ 3 δευτερολέπτων για να μην πέφτει σε άπειρη λούπα αν υπάρξει σφάλμα
+        setTimeout(startNextMedia, 3000); 
     });
 
     ffmpeg.on('error', (err) => {
         console.error('Σφάλμα FFmpeg:', err);
-        startNextMedia();
+        setTimeout(startNextMedia, 3000);
     });
 }
