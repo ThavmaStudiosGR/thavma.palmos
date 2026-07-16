@@ -36,12 +36,11 @@ app.get('/api/now-playing', (req, res) => {
     res.json(currentNowPlaying);
 });
 
-// 2. Επιστρέφει όλη τη λίστα τραγουδιών (για να τα βλέπει ο κόσμος στο site)
+// 2. Επιστρέφει όλη τη λίστα τραγουδιών
 app.get('/api/songs', (req, res) => {
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
     
-    // Καθαρίζουμε τους τίτλους για να φαίνονται όμορφα στο frontend
     const songList = mp3Files.map(file => {
         let displayTitle = file.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
         return { filename: file, title: displayTitle };
@@ -52,27 +51,25 @@ app.get('/api/songs', (req, res) => {
 
 // 3. Δέχεται την παραγγελιά από το frontend
 app.post('/api/request', (req, res) => {
-    const { filename, requester } = req.body; //[cite: 1]
+    const { filename, requester } = req.body;
     
-    if (!filename || !fs.existsSync(path.join(__dirname, filename))) { //[cite: 1]
-        return res.status(400).json({ success: false, message: "Το τραγούδι δεν βρέθηκε." }); //[cite: 1]
+    if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
+        return res.status(400).json({ success: false, message: "Το τραγούδι δεν βρέθηκε." });
     }
 
-    // Αποθηκεύουμε πλέον και το όνομα στην ουρά!
-    requestQueue.push({ filename: filename, requester: requester || "Άγνωστος" }); //[cite: 1]
-    console.log(`[REQUEST ADDED]: Προστέθηκε στην ουρά το ${filename} από τον/την ${requester}`); //[cite: 1]
-    res.json({ success: true, message: "Η παραγγελιά καταχωρήθηκε!" }); //[cite: 1]
+    requestQueue.push({ filename: filename, requester: requester || "Άγνωστος" });
+    console.log(`[REQUEST ADDED]: Προστέθηκε στην ουρά το ${filename} από τον/την ${requester}`);
+    res.json({ success: true, message: "Η παραγγελιά καταχωρήθηκε!" });
 });
 
-// Αυτό το route χρησιμεύει και ως Keep-Alive (Ping) για το Render
+// Keep-Alive (Ping)
 app.get('/', (req, res) => {
     res.send('Thavma Παλμός Automation System v6.2 (Requests Edition) is Running!');
 });
 
 // -- Εκκίνηση Server --
 app.listen(PORT, '0.0.0.0', () => {
-   
-console.log(`Playing [${currentSong.title}]`);
+    console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
     startNextMedia();
 });
 
@@ -140,15 +137,11 @@ function selectNextFile() {
         }
     }
 
-    // 2. Αναγγελία Ώρας
-    const hourFile = findHourFile(time.hour); //[cite: 1]
-        if (hourFile) { //[cite: 1]
-            console.log(`[TIME CHIME] Βρέθηκε το αρχείο ώρας: ${hourFile}`); // ΠΡΟΣΘΗΚΗ[cite: 1]
-            lastAnnouncedHour = time.hour; //[cite: 1]
-
-        if (lastAnnouncedHour !== time.hour) {
+    // 2. Αναγγελία Ώρας (Διορθωμένο!)
+    if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
+            console.log(`[TIME CHIME] Βρέθηκε το αρχείο ώρας: ${hourFile}`);
             lastAnnouncedHour = time.hour;
             currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
             return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
@@ -164,22 +157,20 @@ function selectNextFile() {
         }
     }
 
-    // 4. ΕΛΕΓΧΟΣ ΠΑΡΑΓΓΕΛΙΑΣ (ΝΕΟ!)
-    if (requestQueue.length > 0) { //[cite: 1]
-        const reqData = requestQueue.shift(); // Βγάζουμε το αντικείμενο από την ουρά[cite: 1]
-        const requestedFile = reqData.filename; //[cite: 1]
+    // 4. ΕΛΕΓΧΟΣ ΠΑΡΑΓΓΕΛΙΑΣ
+    if (requestQueue.length > 0) {
+        const reqData = requestQueue.shift();
+        const requestedFile = reqData.filename;
         
-        if (fs.existsSync(path.join(__dirname, requestedFile))) { //[cite: 1]
-            let displayTitle = requestedFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' '); //[cite: 1]
+        if (fs.existsSync(path.join(__dirname, requestedFile))) {
+            let displayTitle = requestedFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
+            let displayGenre = `Παραγγελια Ακροατη [${reqData.requester}]`;
             
-            // Φτιάχνουμε την ταμπέλα που θα πάει στο FFmpeg!
-            let displayGenre = `Παραγγελια Ακροατη [${reqData.requester}]`; //[cite: 1]
-            
-            return { file: requestedFile, title: displayTitle, genreLabel: displayGenre, isSong: true, isRequest: true }; //[cite: 1]
+            return { file: requestedFile, title: displayTitle, genreLabel: displayGenre, isSong: true, isRequest: true };
         }
     }
 
-    // 5. Κανονικό Τραγούδι (Αν δεν υπάρχει παραγγελιά)
+    // 5. Κανονικό Τραγούδι
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
 
@@ -227,18 +218,18 @@ function selectNextFile() {
 }
 
 function startNextMedia() {
-    const media = selectNextFile(); //
+    const media = selectNextFile(); 
     
-    if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) { //[cite: 1]
-        setTimeout(startNextMedia, 5000); //[cite: 1]
-        return; //[cite: 1]
+    if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) {
+        setTimeout(startNextMedia, 5000);
+        return;
     }
 
-    // ΠΡΟΣΘΗΚΗ: Εδώ θα τυπώνει στο Render ποιο τραγούδι παίζει ακριβώς!
-    console.log(`Playing [${media.title}]`); //[cite: 1]
+    console.log(`Playing [${media.title}]`);
 
-    if (media.isHourAnnouncement) songCounter = 0; //[cite: 1]
-// ... (ο υπόλοιπος κώδικας συνεχίζει κανονικά)[cite: 1]
+    if (media.isHourAnnouncement) songCounter = 0;
+    else if (media.isSong && !media.isRequest) songCounter++;
+
     currentNowPlaying = { title: media.title, genre: media.genreLabel };
 
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
@@ -251,12 +242,13 @@ function startNextMedia() {
     const cleanTitle = media.title.replace(/'/g, "’");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
 
+    // Διορθωμένο το κόμμα εδώ!
     const ffmpeg = spawn('ffmpeg', [
         '-re', '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
         '-re', '-i', media.file,
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
-        '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black`, //[cite: 1],
+        '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black`,
         '-r', '15', '-g', '30', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
         '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
