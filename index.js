@@ -1,17 +1,25 @@
 process.env.TZ = 'Europe/Athens';
 
 const express = require('express');
+const cors = require('cors');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// -- Ρυθμίσεις CORS και JSON (SOS για το Frontend) --
+app.use(cors());
+app.use(express.json());
+
 // -- Ρυθμίσεις και Αρχικοποίηση --
 let lastAnnouncedHour = getGreekTime().hour; 
 let lastAnthemDate = getGreekTime().date; 
 let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
+
+// Η ουρά αναμονής για τις Παραγγελιές!
+let requestQueue = []; 
 
 let playedSongs = {
     'B': [],
@@ -22,14 +30,42 @@ let playedSongs = {
 };
 
 // -- API Routes --
+
+// 1. Επιστρέφει τι παίζει τώρα
 app.get('/api/now-playing', (req, res) => {
-    res.header("Access-Control-Allow-Origin", "*");
     res.json(currentNowPlaying);
+});
+
+// 2. Επιστρέφει όλη τη λίστα τραγουδιών (για να τα βλέπει ο κόσμος στο site)
+app.get('/api/songs', (req, res) => {
+    const files = fs.readdirSync(__dirname);
+    let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
+    
+    // Καθαρίζουμε τους τίτλους για να φαίνονται όμορφα στο frontend
+    const songList = mp3Files.map(file => {
+        let displayTitle = file.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
+        return { filename: file, title: displayTitle };
+    });
+    
+    res.json(songList);
+});
+
+// 3. Δέχεται την παραγγελιά από το frontend
+app.post('/api/request', (req, res) => {
+    const { filename } = req.body;
+    
+    if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
+        return res.status(400).json({ success: false, message: "Το τραγούδι δεν βρέθηκε." });
+    }
+
+    requestQueue.push(filename);
+    console.log(`[REQUEST ADDED]: Προστέθηκε στην ουρά το ${filename}`);
+    res.json({ success: true, message: "Η παραγγελιά καταχωρήθηκε!" });
 });
 
 // Αυτό το route χρησιμεύει και ως Keep-Alive (Ping) για το Render
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v6.1 is Running!');
+    res.send('Thavma Παλμός Automation System v6.2 (Requests Edition) is Running!');
 });
 
 // -- Εκκίνηση Server --
@@ -93,6 +129,7 @@ function getRequiredGenre() {
 function selectNextFile() {
     const time = getGreekTime();
     
+    // 1. Εθνικός Ύμνος
     if (time.hour === 0 && lastAnthemDate !== time.date) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
             lastAnthemDate = time.date; 
@@ -101,6 +138,7 @@ function selectNextFile() {
         }
     }
 
+    // 2. Αναγγελία Ώρας
     if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
@@ -110,6 +148,7 @@ function selectNextFile() {
         }
     }
 
+    // 3. Jingle ανά 5 τραγούδια
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
@@ -118,6 +157,17 @@ function selectNextFile() {
         }
     }
 
+    // 4. ΕΛΕΓΧΟΣ ΠΑΡΑΓΓΕΛΙΑΣ (ΝΕΟ!)
+    // Αν υπάρχει τραγούδι στην ουρά, το παίζουμε ΠΡΙΝ το τυχαίο πρόγραμμα!
+    if (requestQueue.length > 0) {
+        const requestedFile = requestQueue.shift(); // Βγάζουμε το πρώτο από την ουρά
+        if (fs.existsSync(path.join(__dirname, requestedFile))) {
+            let displayTitle = requestedFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
+            return { file: requestedFile, title: displayTitle, genreLabel: '🎵 Παραγγελιά Ακροατή', isSong: true, isRequest: true };
+        }
+    }
+
+    // 5. Κανονικό Τραγούδι (Αν δεν υπάρχει παραγγελιά)
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
 
@@ -173,7 +223,7 @@ function startNextMedia() {
     }
 
     if (media.isHourAnnouncement) songCounter = 0; 
-    else if (media.isSong) songCounter++;
+    else if (media.isSong && !media.isRequest) songCounter++; // Αν είναι παραγγελιά δεν μετράει στο 5αρι του Jingle
 
     currentNowPlaying = { title: media.title, genre: media.genreLabel };
 

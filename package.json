@@ -1,11 +1,13 @@
 {
   "name": "thavma-radio-stream",
   "version": "1.0.0",
+  "description": "Thavma Web Radio Backend with Requests",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
   }
 }
