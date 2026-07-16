@@ -163,7 +163,7 @@ function selectNextFile() {
         const requestedFile = requestQueue.shift(); // Βγάζουμε το πρώτο από την ουρά
         if (fs.existsSync(path.join(__dirname, requestedFile))) {
             let displayTitle = requestedFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-            return { file: requestedFile, title: displayTitle, genreLabel: '🎵 Παραγγελιά Ακροατή', isSong: true, isRequest: true };
+            return { file: requestedFile, title: displayTitle, genreLabel: 'Παραγγελιά Ακροατή!', isSong: true, isRequest: true };
         }
     }
 
