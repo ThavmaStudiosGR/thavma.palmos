@@ -8,35 +8,23 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -- Ρυθμίσεις CORS και JSON (SOS για το Frontend) --
 app.use(cors());
 app.use(express.json());
 
-// -- Ρυθμίσεις και Αρχικοποίηση --
 let lastAnnouncedHour = getGreekTime().hour; 
 let lastAnthemDate = getGreekTime().date; 
 let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
-// Η ουρά αναμονής για τις Παραγγελιές!
 let requestQueue = []; 
 
-let playedSongs = {
-    'B': [],
-    'R': [],
-    'P_LZ': [],
-    'MIX_PREFER_P': [],
-    'MIX': []
-};
+// ΝΕΟ: Μία κεντρική μνήμη για το τι έχει παίξει, ώστε να μην υπάρχουν διπλοτυπίες!
+let globalPlayedSongs = [];
 
-// -- API Routes --
-
-// 1. Επιστρέφει τι παίζει τώρα
 app.get('/api/now-playing', (req, res) => {
     res.json(currentNowPlaying);
 });
 
-// 2. Επιστρέφει όλη τη λίστα τραγουδιών
 app.get('/api/songs', (req, res) => {
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
@@ -49,7 +37,6 @@ app.get('/api/songs', (req, res) => {
     res.json(songList);
 });
 
-// 3. Δέχεται την παραγγελιά από το frontend
 app.post('/api/request', (req, res) => {
     const { filename, requester } = req.body;
     
@@ -62,12 +49,10 @@ app.post('/api/request', (req, res) => {
     res.json({ success: true, message: "Η παραγγελιά καταχωρήθηκε!" });
 });
 
-// Keep-Alive (Ping)
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v6.2 (Requests Edition) is Running!');
+    res.send('Thavma Παλμός Automation System v6.3 (Smart Shuffle & Desync Fix) is Running!');
 });
 
-// -- Εκκίνηση Server --
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
     startNextMedia();
@@ -137,7 +122,7 @@ function selectNextFile() {
         }
     }
 
-    // 2. Αναγγελία Ώρας (Διορθωμένο!)
+    // 2. Αναγγελία Ώρας
     if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
@@ -201,16 +186,17 @@ function selectNextFile() {
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
 
-    if (!playedSongs[genre]) playedSongs[genre] = [];
-    let availableFiles = filteredFiles.filter(f => !playedSongs[genre].includes(f));
+    // ΝΕΟ SHUFFLE: Ελέγχει την κεντρική μνήμη
+    let availableFiles = filteredFiles.filter(f => !globalPlayedSongs.includes(f));
 
     if (availableFiles.length === 0) {
-        playedSongs[genre] = [];
+        // Αν έπαιξαν όλα τα τραγούδια της κατηγορίας, καθαρίζει ΑΠΟ ΤΗ ΜΝΗΜΗ μόνο τα συγκεκριμένα για να ξαναπαίξουν
+        globalPlayedSongs = globalPlayedSongs.filter(f => !filteredFiles.includes(f));
         availableFiles = filteredFiles;
     }
 
     const randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
-    playedSongs[genre].push(randomFile);
+    globalPlayedSongs.push(randomFile); // Μπαίνει στη μνήμη!
 
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
@@ -238,14 +224,16 @@ function startNextMedia() {
         return;
     }
 
-    const cleanLabel = media.genreLabel.replace(/'/g, "’");
-    const cleanTitle = media.title.replace(/'/g, "’");
+    // Καθαρισμός ειδικών χαρακτήρων που κρασάρουν το drawtext του FFmpeg
+    const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
+    const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
 
-    // Διορθωμένο το κόμμα εδώ!
+    // ΔΙΟΡΘΩΣΗ FFmpeg: Αφαιρέθηκε το -re από το media.file και μπήκε -fflags +genpts
     const ffmpeg = spawn('ffmpeg', [
         '-re', '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
-        '-re', '-i', media.file,
+        '-i', media.file, 
+        '-fflags', '+genpts',
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
         '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black`,
