@@ -48,7 +48,7 @@ app.post('/api/request', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v6.4 (New Release Priority) is Running!');
+    res.send('Thavma Παλμός Automation System v6.5 (FFmpeg Chime Fix) is Running!');
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -120,14 +120,15 @@ function selectNextFile() {
         }
     }
 
-    // 2. Αναγγελία Ώρας
+    // 2. Αναγγελία Ώρας (Αλλαγή σε τελεία για ασφάλεια)
     if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
             console.log(`[TIME CHIME] Βρέθηκε το αρχείο ώρας: ${hourFile}`);
             lastAnnouncedHour = time.hour;
-            currentNowPlaying = { title: `Η ώρα είναι ${time.hour}:00`, genre: "Ώρα Ελλάδος" };
-            return { file: hourFile, title: `Η ώρα είναι ${time.hour}:00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
+            let hourString = time.hour < 10 ? `0${time.hour}.00` : `${time.hour}.00`;
+            currentNowPlaying = { title: `Η ώρα είναι ${hourString}`, genre: "Ώρα Ελλάδος" };
+            return { file: hourFile, title: `Η ώρα είναι ${hourString}`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
         }
     }
 
@@ -153,7 +154,7 @@ function selectNextFile() {
         }
     }
 
-    // 5. Κανονικό Τραγούδι (Με εντοπισμό Νέων Κυκλοφοριών!)
+    // 5. Κανονικό Τραγούδι
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
 
@@ -165,10 +166,10 @@ function selectNextFile() {
 
     if (genre === 'B') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(B)'));
-        genreLabel = "Beats (Disco, Club, Trap...)";
+        genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(R)'));
-        genreLabel = "Radio";
+        genreLabel = "Radio (Κανονική Ροή)";
     } else if (genre === 'P_LZ') {
         filteredFiles = mp3Files.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
         genreLabel = "Παραδοσιακά & Λαϊκά";
@@ -176,10 +177,10 @@ function selectNextFile() {
         let pFiles = mp3Files.filter(f => f.startsWith('(Π)'));
         if (pFiles.length > 0 && Math.random() < 0.7) filteredFiles = pFiles;
         else filteredFiles = mp3Files;
-        genreLabel = "Mix";
+        genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
     } else {
         filteredFiles = mp3Files;
-        genreLabel = "Mix";
+        genreLabel = "Mix Πρόγραμμα";
     }
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
@@ -191,7 +192,6 @@ function selectNextFile() {
         availableFiles = filteredFiles;
     }
 
-    // Λογική: Έλεγχος για "Νέο Τραγούδι" (Ηλικία κάτω των 3 ημερών)
     const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
     const now = Date.now();
     let randomFile;
@@ -202,14 +202,12 @@ function selectNextFile() {
     });
 
     if (availableNewFiles.length > 0) {
-        // Αν υπάρχουν διαθέσιμα νέα τραγούδια, ταξινομούμε με βάση το πιο φρέσκο upload πρώτο!
         availableNewFiles.sort((a, b) => {
             return fs.statSync(path.join(__dirname, b)).mtimeMs - fs.statSync(path.join(__dirname, a)).mtimeMs;
         });
         randomFile = availableNewFiles[0];
         genreLabel = "ΝΕΟ ΤΡΑΓΟΥΔΙ! - " + genreLabel;
     } else {
-        // Αν δεν υπάρχουν νέα τραγούδια στο συγκεκριμένο είδος, παίζει κανονικό Shuffle
         randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
     }
 
@@ -241,14 +239,16 @@ function startNextMedia() {
         return;
     }
 
-    const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
-    const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
+    // ΑΠΟΛΥΤΟΣ ΚΑΘΑΡΙΣΜΟΣ: Αντικατάσταση του : και , με ασφαλείς χαρακτήρες για το FFmpeg
+    const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, " — ").replace(/,/g, " ");
+    const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, ".").replace(/,/g, " ");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
 
+    // ΣΤΡΩΤΗ ΡΟΗ: Το -fflags μπήκε πρώτο, και το -re μπήκε αποκλειστικά στον ήχο για να παίζουν σωστά τα μικρά αρχεία
     const ffmpeg = spawn('ffmpeg', [
-        '-re', '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
-        '-i', media.file, 
         '-fflags', '+genpts',
+        '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
+        '-re', '-i', media.file, 
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
         '-vf', `scale=1280:720, drawtext=text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8, drawtext=text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10, drawtext=text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black`,
