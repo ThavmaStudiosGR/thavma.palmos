@@ -17,8 +17,6 @@ let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
 let requestQueue = []; 
-
-// ΝΕΟ: Μία κεντρική μνήμη για το τι έχει παίξει, ώστε να μην υπάρχουν διπλοτυπίες!
 let globalPlayedSongs = [];
 
 app.get('/api/now-playing', (req, res) => {
@@ -50,7 +48,7 @@ app.post('/api/request', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v6.3 (Smart Shuffle & Desync Fix) is Running!');
+    res.send('Thavma Παλμός Automation System v6.4 (New Release Priority) is Running!');
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -155,7 +153,7 @@ function selectNextFile() {
         }
     }
 
-    // 5. Κανονικό Τραγούδι
+    // 5. Κανονικό Τραγούδι (Με εντοπισμό Νέων Κυκλοφοριών!)
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
 
@@ -186,17 +184,36 @@ function selectNextFile() {
 
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
 
-    // ΝΕΟ SHUFFLE: Ελέγχει την κεντρική μνήμη
     let availableFiles = filteredFiles.filter(f => !globalPlayedSongs.includes(f));
 
     if (availableFiles.length === 0) {
-        // Αν έπαιξαν όλα τα τραγούδια της κατηγορίας, καθαρίζει ΑΠΟ ΤΗ ΜΝΗΜΗ μόνο τα συγκεκριμένα για να ξαναπαίξουν
         globalPlayedSongs = globalPlayedSongs.filter(f => !filteredFiles.includes(f));
         availableFiles = filteredFiles;
     }
 
-    const randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
-    globalPlayedSongs.push(randomFile); // Μπαίνει στη μνήμη!
+    // Λογική: Έλεγχος για "Νέο Τραγούδι" (Ηλικία κάτω των 3 ημερών)
+    const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    let randomFile;
+
+    let availableNewFiles = availableFiles.filter(f => {
+        const filePath = path.join(__dirname, f);
+        return fs.existsSync(filePath) && (now - fs.statSync(filePath).mtimeMs) <= THREE_DAYS_MS;
+    });
+
+    if (availableNewFiles.length > 0) {
+        // Αν υπάρχουν διαθέσιμα νέα τραγούδια, ταξινομούμε με βάση το πιο φρέσκο upload πρώτο!
+        availableNewFiles.sort((a, b) => {
+            return fs.statSync(path.join(__dirname, b)).mtimeMs - fs.statSync(path.join(__dirname, a)).mtimeMs;
+        });
+        randomFile = availableNewFiles[0];
+        genreLabel = "ΝΕΟ ΤΡΑΓΟΥΔΙ! - " + genreLabel;
+    } else {
+        // Αν δεν υπάρχουν νέα τραγούδια στο συγκεκριμένο είδος, παίζει κανονικό Shuffle
+        randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
+    }
+
+    globalPlayedSongs.push(randomFile);
 
     let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
 
@@ -224,12 +241,10 @@ function startNextMedia() {
         return;
     }
 
-    // Καθαρισμός ειδικών χαρακτήρων που κρασάρουν το drawtext του FFmpeg
     const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
     const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, "\\\\:").replace(/,/g, "\\\\,");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
 
-    // ΔΙΟΡΘΩΣΗ FFmpeg: Αφαιρέθηκε το -re από το media.file και μπήκε -fflags +genpts
     const ffmpeg = spawn('ffmpeg', [
         '-re', '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
         '-i', media.file, 
