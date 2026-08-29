@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
+const nodemailer = require('nodemailer');
 
 app.use(cors());
 app.use(express.json());
@@ -49,6 +50,39 @@ app.post('/api/request', (req, res) => {
 
 app.get('/', (req, res) => {
     res.send('Thavma Παλμός Automation System v6.5 (FFmpeg Chime Fix) is Running!');
+});
+
+app.post('/api/comment', async (req, res) => {
+    const { name, comment } = req.body;
+    
+    if (!name || !comment) {
+        return res.status(400).json({ success: false, message: "Παρακαλώ συμπληρώστε όλα τα πεδία." });
+    }
+
+    // Ρύθμιση του αποστολέα email (Nodemailer)
+    const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.EMAIL_USER, // Το email σου
+            pass: process.env.EMAIL_PASS  // Κωδικός εφαρμογής Gmail
+        }
+    });
+
+    const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: 'nikosthavmagr@gmail.com',
+        subject: `Thavma Παλμός - Νέο Σχόλιο από: ${name}`,
+        text: `Ο Χρήστης ${name} έγραψε το παρακάτω σχόλιο:\n\n"${comment}"\n\nστην ιστοσελίδα [Thavma Παλμός]`
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        console.log(`[EMAIL SENT] Στάλθηκε σχόλιο από ${name}`);
+        res.json({ success: true, message: "Το σχόλιο εστάλη επιτυχώς!" });
+    } catch (error) {
+        console.error("[EMAIL ERROR]", error);
+        res.status(500).json({ success: false, message: "Υπήρξε πρόβλημα στην αποστολή." });
+    }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
