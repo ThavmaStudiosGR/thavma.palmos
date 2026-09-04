@@ -1,0 +1,33 @@
+name: Thavma Palmos 24/7 Live
+
+on:
+  schedule:
+    - cron: '0 */5 * * *' # Επανεκκινεί αυτόματα κάθε 5 ώρες για να μην προλαβαίνει να φτάσει το όριο των 6 ωρών
+  workflow_dispatch: # Σου επιτρέπει να το ξεκινάς και χειροκίνητα με ένα κουμπί
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18
+
+    - name: Install FFmpeg and Fonts
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+    - name: Install Dependencies
+      run: npm install
+
+    - name: Run Radio Automation
+      env:
+        YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+        EMAIL_USER: ${{ secrets.EMAIL_USER }}
+        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      run: node index.js
