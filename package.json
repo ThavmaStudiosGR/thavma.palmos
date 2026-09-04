@@ -1,7 +1,6 @@
 {
-  "name": "thavma-radio-stream",
-  "version": "1.0.0",
-  "description": "Thavma Web Radio Backend with Requests",
+  "name": "thavma-palmos-automation",
+  "version": "6.5.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +8,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "nodemailer": "^6.9.13"
+    "nodemailer": "^6.9.7"
   }
 }
