@@ -9,6 +9,25 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const nodemailer = require('nodemailer');
 
+// ============================================================
+//  SUPABASE
+//  Το Supabase είναι η κεντρική ουρά παραγγελιών.
+//  Το site γράφει την παραγγελιά εδώ και το automation την
+//  διαβάζει από εδώ για να την παίξει στο LIVE.
+// ============================================================
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.warn('[SUPABASE WARNING] Λείπουν SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (ή SUPABASE_KEY). Οι παραγγελιές από Supabase δεν θα λειτουργήσουν.');
+}
+
+const SUPABASE_HEADERS = {
+    'apikey': SUPABASE_KEY || '',
+    'Authorization': `Bearer ${SUPABASE_KEY || ''}`,
+    'Content-Type': 'application/json'
+};
+
 app.use(cors());
 app.use(express.json());
 
@@ -40,16 +59,140 @@ if (!FONT_PATH) {
 const FONT_ARG = FONT_PATH ? `fontfile='${FONT_PATH}':` : '';
 
 let lastAnnouncedHour = getGreekTime().hour;
-let lastAnthemDate = getGreekTime().date;
+let lastAnthemDate = `${getGreekTime().year}-${getGreekTime().month}-${getGreekTime().date}`;
 let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
+// Η παλιά local requestQueue δεν χρησιμοποιείται πλέον για τις παραγγελιές.
+// Η πραγματική ουρά βρίσκεται στο Supabase ώστε το site και το LIVE να
+// βλέπουν την ίδια κατάσταση.
 let requestQueue = [];
 let globalPlayedSongs = [];
 
 // Ουρά υποχρεωτικής, σε σειρά, Πρωτοχρονιάτικης ακολουθίας
 let newYearQueue = [];
 let lastNewYearSequenceKey = null; // π.χ. "2027-1" -> έτος-ημέρα, ώστε να ενεργοποιείται μία φορά
+
+
+// ============================================================
+//  SUPABASE SONG SYNC
+//  Συγχρονίζει τα τοπικά MP3 με τον πίνακα songs.
+//  Δεν διαγράφει εγγραφές από το Supabase.
+// ============================================================
+async function syncSongsToSupabase() {
+    if (!SUPABASE_URL || !SUPABASE_KEY) return;
+
+    try {
+        const files = fs.readdirSync(__dirname)
+            .filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
+
+        if (files.length === 0) {
+            console.log('[SUPABASE] Δεν βρέθηκαν MP3 για συγχρονισμό.');
+            return;
+        }
+
+        const rows = files.map(file => ({
+            filename: file,
+            title: file
+                .replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '')
+                .replace(/\.mp3$/i, '')
+                .replace(/_/g, ' ')
+        }));
+
+        const response = await fetch(`${SUPABASE_URL}/rest/v1/songs?on_conflict=filename`, {
+            method: 'POST',
+            headers: {
+                ...SUPABASE_HEADERS,
+                'Prefer': 'resolution=merge-duplicates,return=minimal'
+            },
+            body: JSON.stringify(rows)
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        console.log(`[SUPABASE] Συγχρονίστηκαν ${rows.length} τραγούδια.`);
+    } catch (error) {
+        console.error('[SUPABASE SONG SYNC ERROR]', error.message);
+    }
+}
+
+// ============================================================
+//  SUPABASE REQUEST
+//  Παίρνει την παλαιότερη μη παιγμένη παραγγελιά.
+//  Η εγγραφή ΔΕΝ γίνεται played πριν επιβεβαιωθεί ότι το αρχείο
+//  υπάρχει τοπικά. Έτσι δεν χάνεται παραγγελιά από λάθος αρχείο.
+// ============================================================
+async function checkSupabaseRequest() {
+    if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+
+    try {
+        const response = await fetch(
+            `${SUPABASE_URL}/rest/v1/requests?played=eq.false&order=created_at.asc&limit=1`,
+            {
+                method: 'GET',
+                headers: SUPABASE_HEADERS
+            }
+        );
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        const requests = await response.json();
+        if (!Array.isArray(requests) || requests.length === 0) return null;
+
+        const request = requests[0];
+        const filename = request.filename;
+
+        if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
+            console.warn(`[SUPABASE REQUEST] Το αρχείο δεν βρέθηκε τοπικά: ${filename}`);
+            return null;
+        }
+
+        return {
+            id: request.id,
+            filename,
+            requester: request.requester || request.name || 'Άγνωστος'
+        };
+    } catch (error) {
+        console.error('[SUPABASE REQUEST ERROR]', error.message);
+        return null;
+    }
+}
+
+// Μαρκάρει την παραγγελιά ως παιγμένη μόνο όταν το FFmpeg ξεκινήσει κανονικά.
+async function markSupabaseRequestPlayed(requestId) {
+    if (!SUPABASE_URL || !SUPABASE_KEY || !requestId) return false;
+
+    try {
+        const response = await fetch(
+            `${SUPABASE_URL}/rest/v1/requests?id=eq.${encodeURIComponent(requestId)}`,
+            {
+                method: 'PATCH',
+                headers: {
+                    ...SUPABASE_HEADERS,
+                    'Prefer': 'return=minimal'
+                },
+                body: JSON.stringify({ played: true })
+            }
+        );
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        console.log(`[SUPABASE REQUEST] Η παραγγελιά ${requestId} σημειώθηκε ως played.`);
+        return true;
+    } catch (error) {
+        console.error('[SUPABASE MARK PLAYED ERROR]', error.message);
+        return false;
+    }
+}
 
 app.get('/api/now-playing', (req, res) => {
     res.json(currentNowPlaying);
@@ -67,16 +210,58 @@ app.get('/api/songs', (req, res) => {
     res.json(songList);
 });
 
-app.post('/api/request', (req, res) => {
+app.post('/api/request', async (req, res) => {
     const { filename, requester } = req.body;
 
     if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
         return res.status(400).json({ success: false, message: "Το τραγούδι δεν βρέθηκε." });
     }
 
-    requestQueue.push({ filename: filename, requester: requester || "Άγνωστος" });
-    console.log(`[REQUEST ADDED]: Προστέθηκε στην ουρά το ${filename} από τον/την ${requester}`);
-    res.json({ success: true, message: "Η παραγγελιά καταχωρήθηκε!" });
+    const cleanRequester = String(requester || "Άγνωστος").trim().slice(0, 80);
+
+    // ΠΡΩΤΑ γράφουμε την παραγγελιά στο Supabase.
+    // Έτσι το site και το LIVE χρησιμοποιούν την ίδια ουρά.
+    if (!SUPABASE_URL || !SUPABASE_KEY) {
+        return res.status(503).json({
+            success: false,
+            message: "Η υπηρεσία παραγγελιών δεν είναι διαθέσιμη αυτή τη στιγμή."
+        });
+    }
+
+    try {
+        const response = await fetch(`${SUPABASE_URL}/rest/v1/requests`, {
+            method: 'POST',
+            headers: {
+                ...SUPABASE_HEADERS,
+                'Prefer': 'return=representation'
+            },
+            body: JSON.stringify({
+                filename,
+                requester: cleanRequester,
+                played: false
+            })
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        const saved = await response.json();
+
+        console.log(`[REQUEST ADDED] ${filename} από ${cleanRequester} -> Supabase`);
+        return res.json({
+            success: true,
+            message: "Η παραγγελιά καταχωρήθηκε!",
+            request: Array.isArray(saved) ? saved[0] : saved
+        });
+    } catch (error) {
+        console.error('[SUPABASE REQUEST INSERT ERROR]', error.message);
+        return res.status(500).json({
+            success: false,
+            message: "Η παραγγελιά δεν μπόρεσε να καταχωρηθεί."
+        });
+    }
 });
 
 app.get('/', (req, res) => {
@@ -116,8 +301,9 @@ app.post('/api/comment', async (req, res) => {
     }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
+    await syncSongsToSupabase();
     startNextMedia();
 });
 
@@ -207,13 +393,14 @@ function getRequiredGenre() {
     return 'MIX';
 }
 
-function selectNextFile() {
+async function selectNextFile() {
     const time = getGreekTime();
 
     // 1. Εθνικός Ύμνος
-    if (time.hour === 0 && lastAnthemDate !== time.date) {
+    const todayKey = `${time.year}-${time.month}-${time.date}`;
+    if (time.hour === 0 && lastAnthemDate !== todayKey) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
-            lastAnthemDate = time.date;
+            lastAnthemDate = todayKey;
             currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
             return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
@@ -267,16 +454,28 @@ function selectNextFile() {
     }
 
     // 4. ΕΛΕΓΧΟΣ ΠΑΡΑΓΓΕΛΙΑΣ
-    if (requestQueue.length > 0) {
-        const reqData = requestQueue.shift();
-        const requestedFile = reqData.filename;
+    // Η παραγγελιά έρχεται από το Supabase, όχι από local memory.
+    // Έτσι μπορεί να σταλεί από το site και να την πάρει το LIVE.
+    const supabaseRequest = await checkSupabaseRequest();
 
-        if (fs.existsSync(path.join(__dirname, requestedFile))) {
-            let displayTitle = requestedFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-            let displayGenre = `Παραγγελια Ακροατη [${reqData.requester}]`;
+    if (supabaseRequest) {
+        const requestedFile = supabaseRequest.filename;
 
-            return { file: requestedFile, title: displayTitle, genreLabel: displayGenre, isSong: true, isRequest: true };
-        }
+        let displayTitle = requestedFile
+            .replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '')
+            .replace(/\.mp3$/i, '')
+            .replace(/_/g, ' ');
+
+        const displayGenre = `Παραγγελία Ακροατή [${supabaseRequest.requester}]`;
+
+        return {
+            file: requestedFile,
+            title: displayTitle,
+            genreLabel: displayGenre,
+            isSong: true,
+            isRequest: true,
+            requestId: supabaseRequest.id
+        };
     }
 
     // 5. Κανονικό Τραγούδι
@@ -474,8 +673,8 @@ function buildNewYearCountdownFilters(spawnTime) {
     };
 }
 
-function startNextMedia() {
-    const media = selectNextFile();
+async function startNextMedia() {
+    const media = await selectNextFile();
 
     if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) {
         setTimeout(startNextMedia, 5000);
@@ -531,15 +730,38 @@ function startNextMedia() {
         '-re',
         '-fflags', '+genpts',
         '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
-        '-i', media.file,
+        '-i', path.join(__dirname, media.file),
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
         '-vf', vfChain,
         '-r', '15', '-g', '30', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
         '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
-    ], { stdio: 'ignore' });
+    ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-    ffmpeg.on('close', startNextMedia);
-    ffmpeg.on('error', startNextMedia);
+    // Μόλις ξεκινήσει το FFmpeg χωρίς άμεσο spawn error, η παραγγελιά
+    // θεωρείται ότι μπήκε στο LIVE και μπορεί να γίνει played.
+    if (media.isRequest && media.requestId) {
+        ffmpeg.once('spawn', () => {
+            markSupabaseRequestPlayed(media.requestId).catch(error => {
+                console.error('[SUPABASE REQUEST PLAYED ERROR]', error.message);
+            });
+        });
+    }
+
+    ffmpeg.stderr.on('data', data => {
+        const message = data.toString().trim();
+        if (message && message.toLowerCase().includes('error')) {
+            console.error('[FFMPEG ERROR]', message);
+        }
+    });
+
+    ffmpeg.on('close', () => {
+        setImmediate(startNextMedia);
+    });
+
+    ffmpeg.on('error', error => {
+        console.error('[FFMPEG SPAWN ERROR]', error.message);
+        setTimeout(startNextMedia, 1000);
+    });
 }
