@@ -405,7 +405,10 @@ async function selectNextFile() {
 
     const christmasActive = isChristmasPeriod(time.month, time.date);
     const xFiles = mp3Files.filter(f => f.startsWith('(X)'));
-    const normalPool = christmasActive ? mp3Files.filter(f => !f.startsWith('(X)')) : mp3Files;
+    // Το normalPool αποκλείει ΠΑΝΤΑ τα (X) Χριστουγεννιάτικα τραγούδια — ανεξάρτητα από
+    // το αν είμαστε σε περίοδο Χριστουγέννων. Το christmasActive αποφασίζει ΜΟΝΟ αν θα
+    // προστεθούν/τονιστούν τα (X) παρακάτω, όχι αν θα αποκλειστούν από το κανονικό MIX.
+    const normalPool = mp3Files.filter(f => !f.startsWith('(X)'));
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
@@ -631,4 +634,3 @@ async function startNextMedia() {
     ffmpeg.on('close', startNextMedia);
     ffmpeg.on('error', startNextMedia);
 }
-
