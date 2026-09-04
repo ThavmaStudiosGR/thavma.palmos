@@ -512,7 +512,7 @@ function startNextMedia() {
 
     // Τα κανονικά overlays (label/title/clock) κρύβονται όσο διαρκεί το blackout + λίγο μετά τα μεσάνυχτα
     let normalOverlayEnable = '';
-    if (ny.suppressNormalOverlayFrom !== null) {
+    if (ny && ny.suppressNormalOverlayFrom !== undefined && ny.suppressNormalOverlayFrom !== null) {
         normalOverlayEnable = `:enable='not(between(t\\,${ny.suppressNormalOverlayFrom.toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
