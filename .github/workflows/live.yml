@@ -1,33 +1,35 @@
-name: Thavma Palmos 24/7 Live
+name: 24/7 Thavma Palmos Radio Automation
 
 on:
   schedule:
-    - cron: '0 */5 * * *' # Επανεκκινεί αυτόματα κάθε 5 ώρες για να μην προλαβαίνει να φτάσει το όριο των 6 ωρών
-  workflow_dispatch: # Σου επιτρέπει να το ξεκινάς και χειροκίνητα με ένα κουμπί
+    - cron: '0 */5 * * *' # Αυτόματο ξεκίνημα από το GitHub κάθε 5 ώρες (24/7)
+  workflow_dispatch:      # Σου επιτρέπει να το ξεκινάς και χειροκίνητα από το κινητό
 
 jobs:
   stream:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
 
     - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
         node-version: 18
 
-    - name: Install FFmpeg and Fonts
+    - name: Install FFmpeg & Fonts
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg fonts-dejavu-core
 
-    - name: Install Dependencies
-      run: npm install
-
-    - name: Run Radio Automation
+    - name: Run Live Stream with 4.5 Hour Timeout
       env:
         YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-      run: node index.js
+      run: |
+        # Τρέχει το index.js και το κλείνει αυτόματα στα 16200 δευτερόλεπτα (4.5 ώρες)
+        # Μετά το break των 15 λεπτών, το cron του GitHub θα το ξαναξεκινήσει μόνο του!
+        timeout 16200 node index.js || true
