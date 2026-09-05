@@ -165,6 +165,11 @@ let globalPlayedSongs = [];
 let newYearQueue = [];
 let lastNewYearSequenceKey = null;
 
+// Κρατάμε αναφορά στην τρέχουσα διεργασία ffmpeg ώστε να μπορούμε να την κλείσουμε
+// καθαρά όταν το GitHub Actions job λάβει σήμα τερματισμού (SEAMLESS HANDOVER).
+let currentFfmpegProcess = null;
+let isShuttingDown = false;
+
 app.get('/api/now-playing', (req, res) => {
     res.json(currentNowPlaying);
 });
@@ -255,6 +260,25 @@ function isHourFile(fileName) {
 }
 
 // ============================================================
+//  ΑΝΘΕΚΤΙΚΟΣ ΕΛΕΓΧΟΣ TAG (Λατινικά vs Ελληνικά ομόγραφα)
+//  Το Λατινικό 'X' (U+0058) και το Ελληνικό 'Χ' Χι (U+03A7) φαίνονται πανομοιότυπα
+//  αλλά είναι διαφορετικοί χαρακτήρες — το ίδιο ισχύει για 'B' (Λατινικό, U+0042)
+//  και 'Β' Βήτα (Ελληνικό, U+0392). Αν τα mp3 αρχεία έχουν φτιαχτεί σε ελληνικό
+//  πληκτρολόγιο, το tag μπορεί να έχει τον ελληνικό χαρακτήρα χωρίς να φαίνεται η
+//  διαφορά με γυμνό μάτι. Ο παρακάτω έλεγχος δέχεται και τις δύο εκδοχές ώστε να
+//  μη χαλάει η κατηγοριοποίηση ανεξάρτητα από το ποιον χαρακτήρα χρησιμοποίησες.
+function hasTag(filename, ...variants) {
+    return variants.some(v => filename.startsWith(`(${v})`));
+}
+const TAG = {
+    BEATS: ['B', 'Β'],       // Λατινικό B, Ελληνικό Βήτα
+    RADIO: ['R', 'Ρ'],       // Λατινικό R, Ελληνικό Ρο
+    PARADOSIAKA: ['Π'],
+    LAIKA_ZEIMBEKIKA: ['ΛΖ'],
+    CHRISTMAS: ['X', 'Χ']    // Λατινικό X, Ελληνικό Χι
+};
+
+// ============================================================
 //  ΧΡΙΣΤΟΥΓΕΝΝΙΑΤΙΚΗ ΠΕΡΙΟΔΟΣ / (X) ΛΟΓΙΚΗ
 // ============================================================
 function isChristmasPeriod(month, date) {
@@ -315,10 +339,16 @@ function getRequiredGenre() {
     // Πασχαλινή περίοδος: υπερισχύει του κανονικού εβδομαδιαίου προγράμματος
     if (isEasterPeriod(time)) return 'EASTER_MODE';
 
+    // Σαββατοκύριακο: MIX όλη μέρα (με έμφαση σε Παραδοσιακά σε συγκεκριμένες ώρες)
     if (d === 0 || d === 6) {
         if ((h >= 12 && h < 16) || (h >= 20 && h < 24)) return 'MIX_PREFER_P';
         return 'MIX';
     }
+
+    // ΚΑΘΕ μέρα (καθημερινές) από 20:00 έως 02:00 -> MIX (όλες οι κατηγορίες μαζί),
+    // ανεξάρτητα από το ποια μέρα της εβδομάδας είναι.
+    if (h >= 20 || h < 2) return 'MIX';
+
     if (d === 1 || d === 3 || d === 5) {
         if (h >= 2 && h < 7) return 'B';
         if (h >= 7 && h < 12) return 'R';
@@ -327,7 +357,7 @@ function getRequiredGenre() {
         return 'MIX';
     }
     if (d === 2 || d === 4) {
-        if (h >= 0 && h < 8) return 'B';
+        if (h >= 2 && h < 8) return 'B';
         if (h >= 8 && h < 12) return 'R';
         if (h >= 12 && h < 16) return 'P_LZ';
         if (h >= 16 && h < 20) return 'R';
@@ -404,34 +434,34 @@ async function selectNextFile() {
     if (mp3Files.length === 0) return null;
 
     const christmasActive = isChristmasPeriod(time.month, time.date);
-    const xFiles = mp3Files.filter(f => f.startsWith('(X)'));
-    // Το normalPool αποκλείει ΠΑΝΤΑ τα (X) Χριστουγεννιάτικα τραγούδια — ανεξάρτητα από
+    const xFiles = mp3Files.filter(f => hasTag(f, ...TAG.CHRISTMAS));
+    // Το normalPool αποκλείει ΠΑΝΤΑ τα (X)/(Χ) Χριστουγεννιάτικα τραγούδια — ανεξάρτητα από
     // το αν είμαστε σε περίοδο Χριστουγέννων. Το christmasActive αποφασίζει ΜΟΝΟ αν θα
-    // προστεθούν/τονιστούν τα (X) παρακάτω, όχι αν θα αποκλειστούν από το κανονικό MIX.
-    const normalPool = mp3Files.filter(f => !f.startsWith('(X)'));
+    // προστεθούν/τονιστούν τα Χριστουγεννιάτικα παρακάτω, όχι αν θα αποκλειστούν από το MIX.
+    const normalPool = mp3Files.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
     let genreLabel = "Mix Πρόγραμμα";
 
     if (genre === 'B') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(B)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.BEATS));
         genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(R)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.RADIO));
         genreLabel = "Radio (Κανονική Ροή)";
     } else if (genre === 'P_LZ') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         genreLabel = "Παραδοσιακά & Λαϊκά";
     } else if (genre === 'MIX_PREFER_P') {
-        let pFiles = normalPool.filter(f => f.startsWith('(Π)'));
+        let pFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA));
         if (pFiles.length > 0 && Math.random() < 0.7) filteredFiles = pFiles;
         else filteredFiles = normalPool;
         genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
     } else if (genre === 'EASTER_MODE') {
         // Πασχαλινή λειτουργία: παίζει κανονικά MIX (όλα τα τραγούδια), αλλά με 20%
         // πιθανότητα να δοθεί έμφαση αποκλειστικά σε τραγούδια (Π) ή (ΛΖ)
-        const easterFiles = normalPool.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
+        const easterFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         if (easterFiles.length > 0 && Math.random() < 0.20) {
             filteredFiles = easterFiles;
             genreLabel = "Πασχαλινό Πρόγραμμα (Έμφαση στα Παραδοσιακά)";
@@ -458,7 +488,10 @@ async function selectNextFile() {
         }
     }
 
-    if (filteredFiles.length === 0) filteredFiles = mp3Files;
+    // Έσχατο fallback: αν ακόμα δεν υπάρχει τίποτα, χρησιμοποίησε το normalPool (όχι τα
+    // ωμά mp3Files) ώστε να ΜΗΝ ξαναμπούν Χριστουγεννιάτικα εκτός περιόδου. Μόνο αν
+    // κυριολεκτικά ΔΕΝ υπάρχει κανένα μη-Χριστουγεννιάτικο τραγούδι, καταφεύγουμε στα πάντα.
+    if (filteredFiles.length === 0) filteredFiles = normalPool.length > 0 ? normalPool : mp3Files;
 
     let availableFiles = filteredFiles.filter(f => !globalPlayedSongs.includes(f));
     if (availableFiles.length === 0) {
@@ -631,6 +664,34 @@ async function startNextMedia() {
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
     ], { stdio: 'ignore' });
 
-    ffmpeg.on('close', startNextMedia);
-    ffmpeg.on('error', startNextMedia);
+    currentFfmpegProcess = ffmpeg;
+
+    ffmpeg.on('close', () => {
+        currentFfmpegProcess = null;
+        if (!isShuttingDown) startNextMedia();
+    });
+    ffmpeg.on('error', () => {
+        currentFfmpegProcess = null;
+        if (!isShuttingDown) startNextMedia();
+    });
 }
+
+// ============================================================
+//  ΗΡΕΜΟΣ ΤΕΡΜΑΤΙΣΜΟΣ (SEAMLESS HANDOVER)
+//  Όταν το GitHub Actions στέλνει το σήμα τερματισμού (μέσω `timeout ... || true`
+//  στο workflow, στα 4.5 ώρες) σταματάμε ΚΑΘΑΡΑ το τρέχον ffmpeg αντί να κοπεί
+//  απότομα το ρεύμα δεδομένων. Το ΝΕΟ job (που ξεκίνησε 30 λεπτά νωρίτερα) έχει ήδη
+//  αναλάβει το stream, οπότε αυτό το κλείσιμο δεν προκαλεί καθόλου διακοπή στο YouTube.
+function gracefulShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[SHUTDOWN] Λήψη σήματος ${signal} — ήρεμος τερματισμός για seamless handover.`);
+    if (currentFfmpegProcess) {
+        currentFfmpegProcess.kill('SIGTERM');
+    }
+    // Μικρό περιθώριο για να προλάβει το ffmpeg να κλείσει καθαρά πριν βγει η διεργασία.
+    setTimeout(() => process.exit(0), 2000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
