@@ -572,6 +572,7 @@ currentNowPlaying = { title: media.title, genre: media.genreLabel };
     const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(', ') : '';
     const vfChain = `scale=854:480${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
 
+    const streamKey = process.env.YOUTUBE_STREAM_KEY;
     const ffmpeg = spawn('ffmpeg', [
         '-re', '-fflags', '+genpts', '-loop', '1', '-framerate', '12', '-i', 'background.jpg',
         '-i', media.file,
