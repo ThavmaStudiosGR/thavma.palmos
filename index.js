@@ -531,12 +531,19 @@ async function startNextMedia() {
     if (media.isHourAnnouncement) songCounter = 0;
     else if (media.isSong && !media.isRequest) songCounter++;
 
-    currentNowPlaying = { title: media.title, genre: media.genreLabel };
+currentNowPlaying = { title: media.title, genre: media.genreLabel };
 
-    const streamKey = process.env.YOUTUBE_STREAM_KEY;
-    if (!streamKey) {
-        setTimeout(startNextMedia, 5000);
-        return;
+    // ΝΕΟ: Γράφει το "τώρα παίζει" στο Supabase ώστε το site (Netlify) να το
+    // διαβάζει ΑΠΕΥΘΕΙΑΣ, χωρίς να χρειάζεται δημόσιο URL για το Node server.
+    if (supabase) {
+        supabase.from('station_status').upsert({
+            id: 1,
+            title: media.title,
+            genre: media.genreLabel,
+            updated_at: new Date().toISOString()
+        }).then(({ error }) => {
+            if (error) console.error('[STATUS SYNC ERROR]', error.message);
+        });
     }
 
     const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, " — ").replace(/,/g, " ");
