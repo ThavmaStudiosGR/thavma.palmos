@@ -30,15 +30,46 @@ const transporter = nodemailer.createTransport({
 });
 
 app.post('/api/request-song', async (req, res) => {
-    const { song, requester, email } = req.body;
-    if (!song || !requester || !email) {
-        return res.status(400).json({ error: 'Λείπουν υποχρεωτικά πεδία' });
+    // ΝΕΑ πεδία: category (προαιρετικό), deviceId (υποχρεωτικό, από το frontend
+    // localStorage), vipCode (προαιρετικό — "TP26" παρακάμπτει το όριο 30 λεπτών).
+    // Το email έγινε προαιρετικό αφού η φόρμα του site δεν το ζητάει πλέον.
+    const { song, requester, category, email, deviceId, vipCode } = req.body;
+    if (!song || !requester || !deviceId) {
+        return res.status(400).json({ error: 'Λείπουν υποχρεωτικά πεδία (όνομα, τραγούδι, deviceId)' });
     }
     if (!supabase) {
         return res.status(503).json({ error: 'Supabase not configured' });
     }
+
+    const isVip = vipCode === 'TP26';
+
     try {
-        const { error } = await supabase.from('song_requests').insert([{ song, requester, email, status: 'pending' }]);
+        if (!isVip) {
+            // Έλεγχος ορίου 30 λεπτών ανά συσκευή (deviceId)
+            const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+            const { data: recent, error: recentErr } = await supabase
+                .from('song_requests')
+                .select('id, created_at')
+                .eq('device_id', deviceId)
+                .gte('created_at', thirtyMinAgo)
+                .limit(1);
+            if (recentErr) throw recentErr;
+            if (recent && recent.length > 0) {
+                return res.status(429).json({
+                    error: 'Μπορείς να στείλεις 1 παραγγελία κάθε 30 λεπτά. Αν έχεις κωδικό VIP, βάλτον για απεριόριστες παραγγελίες.'
+                });
+            }
+        }
+
+        const { error } = await supabase.from('song_requests').insert([{
+            song,
+            requester,
+            category: category || null,
+            email: email || null,
+            device_id: deviceId,
+            is_vip: isVip,
+            status: 'pending'
+        }]);
         if (error) throw error;
         res.json({ success: true });
     } catch (error) {
@@ -83,12 +114,18 @@ async function checkSupabaseRequest() {
         const match = files.find(f => f.toLowerCase().includes(request.song.toLowerCase()) && path.extname(f).toLowerCase() === '.mp3');
         if (match) {
             console.log(`[LIVE REQUEST] Αναπαράγεται: ${match} (από ${request.requester})`);
-            await transporter.sendMail({
-                to: request.email,
-                from: process.env.EMAIL_USER,
-                subject: 'Το τραγούδι σας αναμεταδόθηκε! 🎵',
-                html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${request.song}" αναμεταδίδεται τώρα στο Thavma Παλμός! 🎧</p>`
-            });
+            if (request.email) {
+                try {
+                    await transporter.sendMail({
+                        to: request.email,
+                        from: process.env.EMAIL_USER,
+                        subject: 'Το τραγούδι σας αναμεταδόθηκε! 🎵',
+                        html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${request.song}" αναμεταδίδεται τώρα στο Thavma Παλμός! 🎧</p>`
+                    });
+                } catch (mailErr) {
+                    console.error('[EMAIL ERROR]', mailErr.message);
+                }
+            }
             return { filename: match, requester: request.requester };
         }
     } catch (error) {
@@ -178,11 +215,11 @@ function getRequiredGenre() {
 
     // Τρίτη (2), Πέμπτη (4)
     if (d === 2 || d === 4) {
-        if (h >= 0 && h < 8) return 'B';     // 00:00 – 08:00 | Beats
+        if (h >= 2 && h < 8) return 'B';     // 02:00 – 08:00 | Beats  ← ΔΙΟΡΘΩΘΗΚΕ (ήταν 0)
         if (h >= 8 && h < 12) return 'R';    // 08:00 – 12:00 | Radio
         if (h >= 12 && h < 16) return 'P_LZ';// 12:00 – 16:00 | Παραδοσιακά & Λαϊκά
         if (h >= 16 && h < 20) return 'R';    // 16:00 – 20:00 | Radio
-        return 'MIX';                         // 20:00 – 00:00 | Mix Πρόγραμμα
+        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
     }
 
     return 'MIX';
@@ -335,6 +372,7 @@ async function selectNextFile() {
             genreLabel = "Πασχαλινό Πρόγραμμα (Mix)";
         }
     } else {
+        // genre === 'MIX': ΟΛΟΚΛΗΡΟ το normalPool, όλες οι κατηγορίες μαζί αδιάκριτα
         filteredFiles = normalPool;
         genreLabel = "Mix Πρόγραμμα";
     }
@@ -348,6 +386,8 @@ async function selectNextFile() {
             filteredFiles = xFiles;
             genreLabel = xBoost ? "Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά" : "Χριστουγεννιάτικο Πρόγραμμα (X)";
         } else {
+            // Στο MIX εκτός boost, τα Χριστουγεννιάτικα ΠΡΟΣΤΙΘΕΝΤΑΙ στο υπόλοιπο mix
+            // (δηλ. κατά την περίοδο Χριστουγέννων, MIX = ΚΥΡΙΟΛΕΚΤΙΚΑ όλα μαζί, X included)
             filteredFiles = filteredFiles.concat(xFiles);
         }
     }
@@ -385,6 +425,21 @@ async function selectNextFile() {
 }
 
 function buildNewYearCountdownFilters(spawnTime) {
+    // ============================================================
+    // TEST MODE: Αν το env var TEST_NEWYEAR είναι 'true' (π.χ. από ένα
+    // χειροκίνητο workflow_dispatch run στο GitHub Actions), προσομοιώνουμε
+    // ΟΛΟΚΛΗΡΗ την ακολουθία αντίστροφης μέτρησης σε ~55 δευτερόλεπτα αντί να
+    // περιμένουμε πραγματικά την 31η Δεκεμβρίου. Δεν επηρεάζει ΚΑΘΟΛΟΥ τη
+    // λογική προγράμματος (getRequiredGenre/MIX) — μόνο το οπτικό εφέ αυτού
+    // του ffmpeg process. Μόλις τελειώσει το τεστ, το επόμενο run θα
+    // ξαναδουλεύει κανονικά, αφού το flag δεν παραμένει μόνιμα ενεργό.
+    if (process.env.TEST_NEWYEAR === 'true') {
+        return buildCountdownFromOffsets({
+            off2350: 5, off2359: 25, off235950: 35, offMidnight: 45, nyEnd: 55,
+            nextYear: spawnTime.year + 1
+        });
+    }
+
     const isDec31 = (spawnTime.month === 11 && spawnTime.date === 31);
     const isEarlyJan1 = (spawnTime.month === 0 && spawnTime.date === 1 && spawnTime.hour === 0 && spawnTime.minute === 0 && spawnTime.second < 20);
 
@@ -404,6 +459,11 @@ function buildNewYearCountdownFilters(spawnTime) {
     const nextYear = isDec31 ? spawnTime.year + 1 : spawnTime.year;
     const nyEnd = offMidnight + 10;
 
+    return buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear });
+}
+
+// Εξήχθη σε ξεχωριστή συνάρτηση ώστε να τη μοιράζονται το κανονικό flow και το TEST MODE.
+function buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear }) {
     const filters = [];
     const remainingExpr = `(${offMidnight.toFixed(2)}-t)`;
 
@@ -496,10 +556,11 @@ async function startNextMedia() {
         normalOverlayEnable = `:enable='not(between(t\\,${ny.suppressNormalOverlayFrom.toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
+    // Γραμματοσειρές: κατηγορία/τίτλος μικρότερα & πιο αριστερά (κοντά σε στυλ Century)
     const baseOverlayFilters =
-        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8${normalOverlayEnable},` +
-        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10${normalOverlayEnable},` +
-        `drawtext=fontfile='${TIME_FONT}':text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black${normalOverlayEnable}`;
+        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=22:fontsize=15:fontcolor=yellow:box=1:boxcolor=black@0.55:boxborderw=6${normalOverlayEnable},` +
+        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=50:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=7${normalOverlayEnable},` +
+        `drawtext=fontfile='${TIME_FONT}':text='${clockText}':x=w-tw-20:y=22:fontsize=18:fontcolor=black${normalOverlayEnable}`;
 
     const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(', ') : '';
     const vfChain = `scale=854:480${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
