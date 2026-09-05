@@ -3,7 +3,13 @@ name: Thavma Palmos - 24/7 Live Radio (Seamless Overlap)
 on:
   schedule:
     - cron: '0 */4 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_newyear:
+        description: 'Δοκιμή Countdown Πρωτοχρονιάς (ολοκληρώνεται σε ~55 δευτ.)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   stream:
@@ -49,4 +55,5 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          TEST_NEWYEAR: ${{ inputs.test_newyear }}
         run: timeout 16200 node index.js || true
