@@ -154,32 +154,37 @@ function isEasterPeriod(time) {
 
 function getRequiredGenre() {
     const time = getGreekTime();
-    const d = time.day;
+    const d = time.day; // 0: Κυριακή, 1: Δευτέρα, ..., 6: Σάββατο
     const h = time.hour;
 
-    if (isEasterPeriod(time)) return 'EASTER_MODE';
+    // Πασχαλινό Mode (εφόσον είναι ενεργό)
+    if (isEasterPeriod(time)) {
+        return 'EASTER_MODE';
+    }
 
+    // Σαββατοκύριακο (0 = Κυριακή, 6 = Σάββατο): Όλη μέρα Mix Πρόγραμμα
     if (d === 0 || d === 6) {
-        if ((h >= 12 && h < 16) || (h >= 20 && h < 24)) return 'MIX_PREFER_P';
         return 'MIX';
     }
 
-    if (h >= 20 || h < 2) return 'MIX';
-
+    // Δευτέρα (1), Τετάρτη (3), Παρασκευή (5)
     if (d === 1 || d === 3 || d === 5) {
-        if (h >= 2 && h < 7) return 'B';
-        if (h >= 7 && h < 12) return 'R';
-        if (h >= 12 && h < 17) return 'P_LZ';
-        if (h >= 17 && h < 20) return 'R';
-        return 'MIX';
+        if (h >= 2 && h < 7) return 'B';     // 02:00 – 07:00 | Beats
+        if (h >= 7 && h < 12) return 'R';    // 07:00 – 12:00 | Radio
+        if (h >= 12 && h < 17) return 'P_LZ';// 12:00 – 17:00 | Παραδοσιακά & Λαϊκά
+        if (h >= 17 && h < 20) return 'R';    // 17:00 – 20:00 | Radio
+        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
     }
+
+    // Τρίτη (2), Πέμπτη (4)
     if (d === 2 || d === 4) {
-        if (h >= 2 && h < 8) return 'B';
-        if (h >= 8 && h < 12) return 'R';
-        if (h >= 12 && h < 16) return 'P_LZ';
-        if (h >= 16 && h < 20) return 'R';
-        return 'MIX';
+        if (h >= 0 && h < 8) return 'B';     // 00:00 – 08:00 | Beats
+        if (h >= 8 && h < 12) return 'R';    // 08:00 – 12:00 | Radio
+        if (h >= 12 && h < 16) return 'P_LZ';// 12:00 – 16:00 | Παραδοσιακά & Λαϊκά
+        if (h >= 16 && h < 20) return 'R';    // 16:00 – 20:00 | Radio
+        return 'MIX';                         // 20:00 – 00:00 | Mix Πρόγραμμα
     }
+
     return 'MIX';
 }
 
@@ -237,16 +242,6 @@ function resolveNamedFont(candidateFileNames) {
 const TIME_FONT = resolveNamedFont(['Century.ttf', 'CENTURY.TTF', 'Century Regular.ttf']) || FONT_PATH;
 const TITLE_FONT = resolveNamedFont(['CenturyGothic.ttf', 'GOTHIC.TTF', 'Century Gothic.ttf']) || FONT_PATH;
 const CATEGORY_FONT = resolveNamedFont(['CenturyGothicBold.ttf', 'GOTHICB.TTF', 'Century Gothic Bold.ttf']) || FONT_PATH;
-
-if (TIME_FONT === FONT_PATH) {
-    console.warn('[FONT WARNING] Δεν βρέθηκε η γραμματοσειρά Century — γίνεται χρήση της εφεδρικής για την ώρα.');
-}
-if (TITLE_FONT === FONT_PATH) {
-    console.warn('[FONT WARNING] Δεν βρέθηκε η γραμματοσειρά Century Gothic — γίνεται χρήση της εφεδρικής για τον τίτλο.');
-}
-if (CATEGORY_FONT === FONT_PATH) {
-    console.warn('[FONT WARNING] Δεν βρέθηκε η γραμματοσειρά Century Gothic Bold — γίνεται χρήση της εφεδρικής για την κατηγορία.');
-}
 
 function isNewYearXBoostWindow(month, date, hour) {
     return month === 0 && date === 1 && hour >= 0 && hour < 2;
@@ -330,9 +325,6 @@ async function selectNextFile() {
     } else if (genre === 'P_LZ') {
         filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         genreLabel = "Παραδοσιακά & Λαϊκά";
-    } else if (genre === 'MIX_PREFER_P') {
-        filteredFiles = normalPool;
-        genreLabel = "Mix Πρόγραμμα (Σαββατοκύριακο)";
     } else if (genre === 'EASTER_MODE') {
         const easterFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         if (easterFiles.length > 0 && Math.random() < 0.20) {
@@ -442,23 +434,9 @@ function buildNewYearCountdownFilters(spawnTime) {
         const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:1}`;
         filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
     }
-    
+
     const nyText = `Καλή Χρονιά ${nextYear}!`.replace(/'/g, '');
     filters.push(`drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${offMidnight.toFixed(2)}\\,${nyEnd.toFixed(2)})'`);
-
-    const burstPoints = [
-        { x: 'w0.15', y: 'h0.25', delay: 0.3 },
-        { x: 'w0.85', y: 'h0.20', delay: 0.9 },
-        { x: 'w0.25', y: 'h0.75', delay: 1.6 },
-        { x: 'w0.75', y: 'h0.70', delay: 2.3 },
-        { x: 'w0.50', y: 'h0.15', delay: 3.0 },
-    ];
-    burstPoints.forEach((b, idx) => {
-        const bStart = offMidnight + b.delay;
-        const bEnd = bStart + 1.2;
-        const color = idx % 2 === 0 ? '0xFFD700' : '0xFF4444';
-        filters.push(`drawtext=${FONT_ARG}text='✦':x=${b.x}:y=${b.y}:fontsize=80:fontcolor=${color}:enable='between(t\\,${bStart.toFixed(2)}\\,${bEnd.toFixed(2)})'`);
-    });
 
     return {
         filters,
