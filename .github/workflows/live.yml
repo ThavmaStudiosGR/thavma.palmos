@@ -20,7 +20,7 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install --omit=dev
+        run: npm install express @supabase/supabase-js nodemailer
 
       - name: Verify ffmpeg is available
         run: |
