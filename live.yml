@@ -1,33 +1,69 @@
-name: Thavma Palmos 24/7 Live
+name: Thavma Palmos - 24/7 Live Radio (Seamless Overlap)
 
 on:
   schedule:
-    - cron: '0 */5 * * *' # Επανεκκινεί αυτόματα κάθε 5 ώρες για να μην προλαβαίνει να φτάσει το όριο των 6 ωρών
-  workflow_dispatch: # Σου επιτρέπει να το ξεκινάς και χειροκίνητα με ένα κουμπί
+    # Νέο job κάθε 4 ώρες. ΠΡΟΣΟΧΗ: το GitHub Actions cron δουλεύει σε UTC, όχι ώρα
+    # Ελλάδας — αυτό δεν πειράζει τη λογική του overlap (είναι σχετική, όχι απόλυτη),
+    # απλά να το ξέρεις αν ψάχνεις τις ώρες εκκίνησης στα logs.
+    - cron: '0 */4 * * *'
+  workflow_dispatch: {} # Επιτρέπει και χειροκίνητη εκκίνηση από το GitHub UI
 
+# ΣΚΟΠΙΜΑ δεν ορίζουμε 'concurrency' εδώ. Το GitHub Actions επιτρέπει από προεπιλογή
+# πολλαπλά ταυτόχρονα runs του ίδιου workflow. Αν προσθέσεις concurrency group με το
+# ίδιο όνομα σε όλα τα runs, το νέο job θα ΣΚΟΤΩΝΕΙ το παλιό αμέσως — αντίθετο από
+# αυτό που θέλουμε (30 λεπτά παράλληλης λειτουργίας).
 jobs:
   stream:
     runs-on: ubuntu-latest
+    # Το ίδιο το GitHub Actions job timeout. Το βάζουμε λίγο πιο πάνω από το εσωτερικό
+    # timeout του 4.5ώρου (270') ώστε ο εσωτερικός χρονομετρητής να προλάβει να κλείσει
+    # πρώτος καθαρά, πριν αναγκαστικά το σκοτώσει το GitHub.
+    timeout-minutes: 280
+
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/node-core@v3
-      with:
-        node-version: 18
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
 
-    - name: Install FFmpeg and Fonts
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - name: Install dependencies
+        run: npm ci --omit=dev
 
-    - name: Install Dependencies
-      run: npm install
+      - name: Verify ffmpeg is available
+        run: |
+          if ! command -v ffmpeg &> /dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
 
-    - name: Run Radio Automation
-      env:
-        YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
-        EMAIL_USER: ${{ secrets.EMAIL_USER }}
-        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-      run: node index.js
+      - name: Install custom fonts (Century / Century Gothic renamed files, αν υπάρχουν στο repo)
+        run: |
+          mkdir -p /usr/share/fonts/truetype/custom
+          if [ -d "./fonts" ]; then
+            sudo cp ./fonts/*.ttf /usr/share/fonts/truetype/custom/ 2>/dev/null || true
+            sudo fc-cache -f -v /usr/share/fonts/truetype/custom/
+            echo "Custom fonts installed:"
+            ls -la /usr/share/fonts/truetype/custom/
+          else
+            echo "Δεν βρέθηκε φάκελος ./fonts στο repo — θα χρησιμοποιηθεί η εφεδρική γραμματοσειρά (DejaVu)."
+          fi
+
+      - name: Run 24/7 radio stream (auto-exits cleanly after 4.5 hours)
+        env:
+          YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: |
+          # Ο 'timeout' στέλνει SIGTERM στο node process ακριβώς στα 16200 δευτ. (4.5 ώρες).
+          # Το index.js πιάνει το SIGTERM (gracefulShutdown) και κλείνει καθαρά το ffmpeg.
+          # Το '|| true' εξασφαλίζει ότι το step ΔΕΝ θα σημειωθεί ως αποτυχημένο (failed)
+          # απλά επειδή ο node τερματίστηκε λόγω του timeout — αυτό είναι αναμενόμενο και
+          # φυσιολογικό, όχι σφάλμα.
+          timeout 16200 node index.js || true
