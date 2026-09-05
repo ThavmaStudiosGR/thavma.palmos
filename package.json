@@ -1,6 +1,6 @@
 {
   "name": "thavma-palmos-automation",
-  "version": "6.5.0",
+  "version": "9.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -8,6 +8,10 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
     "nodemailer": "^6.9.7"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

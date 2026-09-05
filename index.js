@@ -1,347 +1,156 @@
 process.env.TZ = 'Europe/Athens';
 
 const express = require('express');
-const cors = require('cors');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const nodemailer = require('nodemailer');
+const { createClient } = require('@supabase/supabase-js');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
-const nodemailer = require('nodemailer');
 
-// ============================================================
-//  SUPABASE
-//  Το Supabase είναι η κεντρική ουρά παραγγελιών.
-//  Το site γράφει την παραγγελιά εδώ και το automation την
-//  διαβάζει από εδώ για να την παίξει στο LIVE.
-// ============================================================
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.warn('[SUPABASE WARNING] Λείπουν SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY (ή SUPABASE_KEY). Οι παραγγελιές από Supabase δεν θα λειτουργήσουν.');
-}
-
-const SUPABASE_HEADERS = {
-    'apikey': SUPABASE_KEY || '',
-    'Authorization': `Bearer ${SUPABASE_KEY || ''}`,
-    'Content-Type': 'application/json'
-};
-
-app.use(cors());
 app.use(express.json());
 
-// ============================================================
-//  ΓΡΑΜΜΑΤΟΣΕΙΡΑ (FFmpeg Font Fix - Ελληνικά χωρίς τετραγωνάκια)
-// ============================================================
-const FONT_CANDIDATES = [
-    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-    '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',
-    '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
-    '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-];
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-function resolveFont() {
-    for (const candidate of FONT_CANDIDATES) {
-        if (fs.existsSync(candidate)) return candidate;
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('[SUPABASE ERROR] Λείπουν τα SUPABASE_URL ή SUPABASE_KEY από τα GitHub Secrets!');
+}
+
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
     }
-    return null;
-}
+});
 
-const FONT_PATH = resolveFont();
-if (!FONT_PATH) {
-    console.warn('[FONT WARNING] Δεν βρέθηκε καμία από τις προτεινόμενες γραμματοσειρές. Εγκατάστησε π.χ. `apt-get install fonts-dejavu-core` για σωστή απεικόνιση ελληνικών.');
-} else {
-    console.log(`[FONT] Χρήση γραμματοσειράς: ${FONT_PATH}`);
-}
+app.post('/api/request-song', async (req, res) => {
+    // ΝΕΑ πεδία: category (προαιρετικό), deviceId (υποχρεωτικό, από το frontend
+    // localStorage), vipCode (προαιρετικό — "TP26" παρακάμπτει το όριο 30 λεπτών).
+    // Το email έγινε προαιρετικό αφού η φόρμα του site δεν το ζητάει πλέον.
+    const { song, requester, category, email, deviceId, vipCode } = req.body;
+    if (!song || !requester || !deviceId) {
+        return res.status(400).json({ error: 'Λείπουν υποχρεωτικά πεδία (όνομα, τραγούδι, deviceId)' });
+    }
+    if (!supabase) {
+        return res.status(503).json({ error: 'Supabase not configured' });
+    }
 
-// Το fontfile='...' κομμάτι που μπαίνει μέσα σε κάθε drawtext filter
-const FONT_ARG = FONT_PATH ? `fontfile='${FONT_PATH}':` : '';
-
-let lastAnnouncedHour = getGreekTime().hour;
-let lastAnthemDate = `${getGreekTime().year}-${getGreekTime().month}-${getGreekTime().date}`;
-let songCounter = 0;
-let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
-
-// Η παλιά local requestQueue δεν χρησιμοποιείται πλέον για τις παραγγελιές.
-// Η πραγματική ουρά βρίσκεται στο Supabase ώστε το site και το LIVE να
-// βλέπουν την ίδια κατάσταση.
-let requestQueue = [];
-let globalPlayedSongs = [];
-
-// Ουρά υποχρεωτικής, σε σειρά, Πρωτοχρονιάτικης ακολουθίας
-let newYearQueue = [];
-let lastNewYearSequenceKey = null; // π.χ. "2027-1" -> έτος-ημέρα, ώστε να ενεργοποιείται μία φορά
-
-
-// ============================================================
-//  SUPABASE SONG SYNC
-//  Συγχρονίζει τα τοπικά MP3 με τον πίνακα songs.
-//  Δεν διαγράφει εγγραφές από το Supabase.
-// ============================================================
-async function syncSongsToSupabase() {
-    if (!SUPABASE_URL || !SUPABASE_KEY) return;
+    const isVip = vipCode === 'TP26';
 
     try {
-        const files = fs.readdirSync(__dirname)
-            .filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
-
-        if (files.length === 0) {
-            console.log('[SUPABASE] Δεν βρέθηκαν MP3 για συγχρονισμό.');
-            return;
-        }
-
-        const rows = files.map(file => ({
-            filename: file,
-            title: file
-                .replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '')
-                .replace(/\.mp3$/i, '')
-                .replace(/_/g, ' ')
-        }));
-
-        const response = await fetch(`${SUPABASE_URL}/rest/v1/songs?on_conflict=filename`, {
-            method: 'POST',
-            headers: {
-                ...SUPABASE_HEADERS,
-                'Prefer': 'resolution=merge-duplicates,return=minimal'
-            },
-            body: JSON.stringify(rows)
-        });
-
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`HTTP ${response.status}: ${text}`);
-        }
-
-        console.log(`[SUPABASE] Συγχρονίστηκαν ${rows.length} τραγούδια.`);
-    } catch (error) {
-        console.error('[SUPABASE SONG SYNC ERROR]', error.message);
-    }
-}
-
-// ============================================================
-//  SUPABASE REQUEST
-//  Παίρνει την παλαιότερη μη παιγμένη παραγγελιά.
-//  Η εγγραφή ΔΕΝ γίνεται played πριν επιβεβαιωθεί ότι το αρχείο
-//  υπάρχει τοπικά. Έτσι δεν χάνεται παραγγελιά από λάθος αρχείο.
-// ============================================================
-async function checkSupabaseRequest() {
-    if (!SUPABASE_URL || !SUPABASE_KEY) return null;
-
-    try {
-        const response = await fetch(
-            `${SUPABASE_URL}/rest/v1/requests?played=eq.false&order=created_at.asc&limit=1`,
-            {
-                method: 'GET',
-                headers: SUPABASE_HEADERS
+        if (!isVip) {
+            // Έλεγχος ορίου 30 λεπτών ανά συσκευή (deviceId)
+            const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+            const { data: recent, error: recentErr } = await supabase
+                .from('song_requests')
+                .select('id, created_at')
+                .eq('device_id', deviceId)
+                .gte('created_at', thirtyMinAgo)
+                .limit(1);
+            if (recentErr) throw recentErr;
+            if (recent && recent.length > 0) {
+                return res.status(429).json({
+                    error: 'Μπορείς να στείλεις 1 παραγγελία κάθε 30 λεπτά. Αν έχεις κωδικό VIP, βάλτον για απεριόριστες παραγγελίες.'
+                });
             }
-        );
-
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`HTTP ${response.status}: ${text}`);
         }
 
-        const requests = await response.json();
-        if (!Array.isArray(requests) || requests.length === 0) return null;
-
-        const request = requests[0];
-        const filename = request.filename;
-
-        if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
-            console.warn(`[SUPABASE REQUEST] Το αρχείο δεν βρέθηκε τοπικά: ${filename}`);
-            return null;
-        }
-
-        return {
-            id: request.id,
-            filename,
-            requester: request.requester || request.name || 'Άγνωστος'
-        };
+        const { error } = await supabase.from('song_requests').insert([{
+            song,
+            requester,
+            category: category || null,
+            email: email || null,
+            device_id: deviceId,
+            is_vip: isVip,
+            status: 'pending'
+        }]);
+        if (error) throw error;
+        res.json({ success: true });
     } catch (error) {
-        console.error('[SUPABASE REQUEST ERROR]', error.message);
-        return null;
+        console.error('[REQUEST ERROR]', error.message);
+        res.status(500).json({ error: 'Σφάλμα κατά την αποθήκευση της παραγγελίας' });
     }
-}
-
-// Μαρκάρει την παραγγελιά ως παιγμένη μόνο όταν το FFmpeg ξεκινήσει κανονικά.
-async function markSupabaseRequestPlayed(requestId) {
-    if (!SUPABASE_URL || !SUPABASE_KEY || !requestId) return false;
-
-    try {
-        const response = await fetch(
-            `${SUPABASE_URL}/rest/v1/requests?id=eq.${encodeURIComponent(requestId)}`,
-            {
-                method: 'PATCH',
-                headers: {
-                    ...SUPABASE_HEADERS,
-                    'Prefer': 'return=minimal'
-                },
-                body: JSON.stringify({ played: true })
-            }
-        );
-
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`HTTP ${response.status}: ${text}`);
-        }
-
-        console.log(`[SUPABASE REQUEST] Η παραγγελιά ${requestId} σημειώθηκε ως played.`);
-        return true;
-    } catch (error) {
-        console.error('[SUPABASE MARK PLAYED ERROR]', error.message);
-        return false;
-    }
-}
+});
 
 app.get('/api/now-playing', (req, res) => {
     res.json(currentNowPlaying);
 });
 
-app.get('/api/songs', (req, res) => {
-    const files = fs.readdirSync(__dirname);
-    let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
-
-    const songList = mp3Files.map(file => {
-        let displayTitle = file.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-        return { filename: file, title: displayTitle };
-    });
-
-    res.json(songList);
-});
-
-app.post('/api/request', async (req, res) => {
-    const { filename, requester } = req.body;
-
-    if (!filename || !fs.existsSync(path.join(__dirname, filename))) {
-        return res.status(400).json({ success: false, message: "Το τραγούδι δεν βρέθηκε." });
-    }
-
-    const cleanRequester = String(requester || "Άγνωστος").trim().slice(0, 80);
-
-    // ΠΡΩΤΑ γράφουμε την παραγγελιά στο Supabase.
-    // Έτσι το site και το LIVE χρησιμοποιούν την ίδια ουρά.
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
-        return res.status(503).json({
-            success: false,
-            message: "Η υπηρεσία παραγγελιών δεν είναι διαθέσιμη αυτή τη στιγμή."
-        });
-    }
-
+async function syncSongsToSupabase() {
+    if (!supabase) return;
     try {
-        const response = await fetch(`${SUPABASE_URL}/rest/v1/requests`, {
-            method: 'POST',
-            headers: {
-                ...SUPABASE_HEADERS,
-                'Prefer': 'return=representation'
-            },
-            body: JSON.stringify({
-                filename,
-                requester: cleanRequester,
-                played: false
-            })
-        });
-
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(`HTTP ${response.status}: ${text}`);
-        }
-
-        const saved = await response.json();
-
-        console.log(`[REQUEST ADDED] ${filename} από ${cleanRequester} -> Supabase`);
-        return res.json({
-            success: true,
-            message: "Η παραγγελιά καταχωρήθηκε!",
-            request: Array.isArray(saved) ? saved[0] : saved
-        });
+        const files = fs.readdirSync(__dirname);
+        const mp3Files = files.filter(f => path.extname(f).toLowerCase() === '.mp3' && !isHourFile(f));
+        const { error } = await supabase.from('songs').upsert(
+            mp3Files.map(f => ({ filename: f, synced_at: new Date() })),
+            { onConflict: 'filename' }
+        );
+        if (error) throw error;
+        console.log(`[SUPABASE SYNC] Συγχρονίστηκαν ${mp3Files.length} τραγούδια`);
     } catch (error) {
-        console.error('[SUPABASE REQUEST INSERT ERROR]', error.message);
-        return res.status(500).json({
-            success: false,
-            message: "Η παραγγελιά δεν μπόρεσε να καταχωρηθεί."
-        });
+        console.error('[SYNC ERROR]', error.message);
     }
-});
+}
 
-app.get('/', (req, res) => {
-    res.send('Thavma Παλμός Automation System v7.0 (Greek Font Fix + Christmas/NYE FX) is Running!');
-});
-
-app.post('/api/comment', async (req, res) => {
-    const { name, comment } = req.body;
-
-    if (!name || !comment) {
-        return res.status(400).json({ success: false, message: "Παρακαλώ συμπληρώστε όλα τα πεδία." });
-    }
-
-    // Ρύθμιση του αποστολέα email (Nodemailer)
-    const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER, // Το email σου
-            pass: process.env.EMAIL_PASS  // Κωδικός εφαρμογής Gmail
-        }
-    });
-
-    const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: 'nikosthavmagr@gmail.com',
-        subject: `Thavma Παλμός - Νέο Σχόλιο από: ${name}`,
-        text: `Ο Χρήστης ${name} έγραψε το παρακάτω σχόλιο:\n\n"${comment}"\n\nστην ιστοσελίδα [Thavma Παλμός]`
-    };
-
+async function checkSupabaseRequest() {
+    if (!supabase) return null;
     try {
-        await transporter.sendMail(mailOptions);
-        console.log(`[EMAIL SENT] Στάλθηκε σχόλιο από ${name}`);
-        res.json({ success: true, message: "Το σχόλιο εστάλη επιτυχώς!" });
+        const { data, error } = await supabase
+            .from('song_requests')
+            .select('*')
+            .eq('status', 'pending')
+            .order('created_at', { ascending: true })
+            .limit(1);
+        if (error || !data || data.length === 0) return null;
+        const request = data[0];
+        await supabase.from('song_requests').update({ status: 'processed' }).eq('id', request.id);
+        const files = fs.readdirSync(__dirname);
+        const match = files.find(f => f.toLowerCase().includes(request.song.toLowerCase()) && path.extname(f).toLowerCase() === '.mp3');
+        if (match) {
+            console.log(`[LIVE REQUEST] Αναπαράγεται: ${match} (από ${request.requester})`);
+            if (request.email) {
+                try {
+                    await transporter.sendMail({
+                        to: request.email,
+                        from: process.env.EMAIL_USER,
+                        subject: 'Το τραγούδι σας αναμεταδόθηκε! 🎵',
+                        html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${request.song}" αναμεταδίδεται τώρα στο Thavma Παλμός! 🎧</p>`
+                    });
+                } catch (mailErr) {
+                    console.error('[EMAIL ERROR]', mailErr.message);
+                }
+            }
+            return { filename: match, requester: request.requester };
+        }
     } catch (error) {
-        console.error("[EMAIL ERROR]", error);
-        res.status(500).json({ success: false, message: "Υπήρξε πρόβλημα στην αποστολή." });
+        console.error('[REQUEST CHECK ERROR]', error.message);
     }
-});
+    return null;
+}
 
-app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
-    await syncSongsToSupabase();
-    startNextMedia();
-});
-
-// ============================================================
-//  ΧΡΟΝΟΣ (Ελλάδα)
-// ============================================================
 function getGreekTime() {
-    const date = new Date();
-    const greekString = date.toLocaleString("en-US", { timeZone: "Europe/Athens" });
-    const greekDate = new Date(greekString);
+    const now = new Date();
     return {
-        raw: greekDate,
-        day: greekDate.getDay(),
-        date: greekDate.getDate(),
-        month: greekDate.getMonth(),   // 0 = Ιανουάριος ... 11 = Δεκέμβριος
-        year: greekDate.getFullYear(),
-        hour: greekDate.getHours(),
-        minute: greekDate.getMinutes(),
-        second: greekDate.getSeconds()
+        raw: now,
+        year: now.getFullYear(),
+        month: now.getMonth(),
+        date: now.getDate(),
+        day: now.getDay(),
+        hour: now.getHours(),
+        minute: now.getMinutes(),
+        second: now.getSeconds()
     };
-}
-
-// Βοηθητικό: Date object στην "Ελληνική" βάση του δοσμένου getGreekTime(), με offset ημερών & ώρα-στόχο
-function athensTargetDate(t, dayOffset, hour, minute, second) {
-    return new Date(t.raw.getFullYear(), t.raw.getMonth(), t.raw.getDate() + dayOffset, hour, minute, second, 0);
-}
-
-// Δευτερόλεπτα από "τώρα" (t.raw) μέχρι μια target ημερομηνία/ώρα. Μπορεί να είναι αρνητικό αν έχει ήδη περάσει.
-function secondsFromNowTo(t, targetDate) {
-    return (targetDate.getTime() - t.raw.getTime()) / 1000;
 }
 
 function findHourFile(hour) {
-    const expectedFile = `clock${hour}.mp3`;
-    if (fs.existsSync(path.join(__dirname, expectedFile))) {
-        return expectedFile;
-    }
-    return null;
+    const hourFileName = `clock${hour}.mp3`;
+    return fs.existsSync(path.join(__dirname, hourFileName)) ? hourFileName : null;
 }
 
 function isHourFile(fileName) {
@@ -351,183 +160,234 @@ function isHourFile(fileName) {
     return /^clock\d+\.mp3$/.test(fileName);
 }
 
-// ============================================================
-//  ΧΡΙΣΤΟΥΓΕΝΝΙΑΤΙΚΗ ΠΕΡΙΟΔΟΣ / (X) ΛΟΓΙΚΗ
-// ============================================================
-// Περίοδος: 18 Νοεμβρίου -> 31 Ιανουαρίου (wrap γύρω από τη χρονιά)
 function isChristmasPeriod(month, date) {
-    if (month === 10 && date >= 18) return true; // Νοέμβριος από 18 και μετά
-    if (month === 11) return true;                // Ολόκληρος ο Δεκέμβριος
-    if (month === 0) return true;                 // Ολόκληρος ο Ιανουάριος
-    return false;
+    return (month === 10 && date >= 18) || month === 11 || (month === 0 && date <= 31);
 }
 
-// 1η Ιανουαρίου 00:00 - 02:00 -> boost του (X) στο 80%
-function isNewYearXBoostWindow(month, date, hour) {
-    return month === 0 && date === 1 && hour >= 0 && hour < 2;
+function getOrthodoxEasterDate(year) {
+    const a = year % 4;
+    const b = year % 7;
+    const c = year % 19;
+    const d = (19 * c + 15) % 30;
+    const e = (2 * a + 4 * b - d + 34) % 7;
+    const julianMonth = Math.floor((d + e + 114) / 31);
+    const julianDay = ((d + e + 114) % 31) + 1;
+    const easterUTC = new Date(Date.UTC(year, julianMonth - 1, julianDay));
+    easterUTC.setUTCDate(easterUTC.getUTCDate() + 13);
+    return easterUTC;
+}
+
+function isEasterPeriod(time) {
+    const easterSunday = getOrthodoxEasterDate(time.year);
+    const holyMonday = new Date(easterSunday);
+    holyMonday.setUTCDate(easterSunday.getUTCDate() - 6);
+    holyMonday.setUTCHours(0, 0, 0, 0);
+    const thomasSunday = new Date(easterSunday);
+    thomasSunday.setUTCDate(easterSunday.getUTCDate() + 7);
+    thomasSunday.setUTCHours(23, 59, 59, 999);
+    const todayUTC = new Date(Date.UTC(time.year, time.month, time.date));
+    return todayUTC >= holyMonday && todayUTC <= thomasSunday;
 }
 
 function getRequiredGenre() {
     const time = getGreekTime();
-    const d = time.day;
+    const d = time.day; // 0: Κυριακή, 1: Δευτέρα, ..., 6: Σάββατο
     const h = time.hour;
 
+    // Πασχαλινό Mode (εφόσον είναι ενεργό)
+    if (isEasterPeriod(time)) {
+        return 'EASTER_MODE';
+    }
+
+    // Σαββατοκύριακο (0 = Κυριακή, 6 = Σάββατο): Όλη μέρα Mix Πρόγραμμα
     if (d === 0 || d === 6) {
-        if ((h >= 12 && h < 16) || (h >= 20 && h < 24)) return 'MIX_PREFER_P';
         return 'MIX';
     }
+
+    // Δευτέρα (1), Τετάρτη (3), Παρασκευή (5)
     if (d === 1 || d === 3 || d === 5) {
-        if (h >= 2 && h < 7) return 'B';
-        if (h >= 7 && h < 12) return 'R';
-        if (h >= 12 && h < 17) return 'P_LZ';
-        if (h >= 17 && h < 20) return 'R';
-        return 'MIX';
+        if (h >= 2 && h < 7) return 'B';     // 02:00 – 07:00 | Beats
+        if (h >= 7 && h < 12) return 'R';    // 07:00 – 12:00 | Radio
+        if (h >= 12 && h < 17) return 'P_LZ';// 12:00 – 17:00 | Παραδοσιακά & Λαϊκά
+        if (h >= 17 && h < 20) return 'R';    // 17:00 – 20:00 | Radio
+        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
     }
+
+    // Τρίτη (2), Πέμπτη (4)
     if (d === 2 || d === 4) {
-        if (h >= 0 && h < 8) return 'B';
-        if (h >= 8 && h < 12) return 'R';
-        if (h >= 12 && h < 16) return 'P_LZ';
-        if (h >= 16 && h < 20) return 'R';
-        return 'MIX';
+        if (h >= 2 && h < 8) return 'B';     // 02:00 – 08:00 | Beats  ← ΔΙΟΡΘΩΘΗΚΕ (ήταν 0)
+        if (h >= 8 && h < 12) return 'R';    // 08:00 – 12:00 | Radio
+        if (h >= 12 && h < 16) return 'P_LZ';// 12:00 – 16:00 | Παραδοσιακά & Λαϊκά
+        if (h >= 16 && h < 20) return 'R';    // 16:00 – 20:00 | Radio
+        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
     }
+
     return 'MIX';
+}
+
+let lastAnnouncedHour = getGreekTime().hour;
+let lastAnthemDate = getGreekTime().date;
+let songCounter = 0;
+let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
+
+let globalPlayedSongs = [];
+let newYearQueue = [];
+let lastNewYearSequenceKey = null;
+
+let currentFfmpegProcess = null;
+let isShuttingDown = false;
+
+function hasTag(filename, ...variants) {
+    return variants.some(v => filename.startsWith(`(${v})`));
+}
+
+function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+const TAG = {
+    BEATS: ['B'],
+    RADIO: ['R'],
+    PARADOSIAKA: ['Π'],
+    LAIKA_ZEIMBEKIKA: ['ΛΖ'],
+    CHRISTMAS: ['X']
+};
+
+const FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+if (fs.existsSync(FONT_PATH)) {
+    console.log('[FONT] Χρήση γραμματοσειράς: ' + FONT_PATH);
+} else {
+    console.warn('[FONT WARNING] Δεν βρέθηκε η γραμματοσειρά.');
+}
+
+const FONT_ARG = FONT_PATH ? `fontfile='${FONT_PATH}':` : '';
+
+const CUSTOM_FONT_DIR = '/usr/share/fonts/truetype/custom';
+
+function resolveNamedFont(candidateFileNames) {
+    for (const name of candidateFileNames) {
+        const p = path.join(CUSTOM_FONT_DIR, name);
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
+const TIME_FONT = resolveNamedFont(['Century.ttf', 'CENTURY.TTF', 'Century Regular.ttf']) || FONT_PATH;
+const TITLE_FONT = resolveNamedFont(['CenturyGothic.ttf', 'GOTHIC.TTF', 'Century Gothic.ttf']) || FONT_PATH;
+const CATEGORY_FONT = resolveNamedFont(['CenturyGothicBold.ttf', 'GOTHICB.TTF', 'Century Gothic Bold.ttf']) || FONT_PATH;
+
+function isNewYearXBoostWindow(month, date, hour) {
+    return month === 0 && date === 1 && hour >= 0 && hour < 2;
 }
 
 async function selectNextFile() {
     const time = getGreekTime();
 
-    // 1. Εθνικός Ύμνος
-    const todayKey = `${time.year}-${time.month}-${time.date}`;
-    if (time.hour === 0 && lastAnthemDate !== todayKey) {
+    if (time.hour === 0 && lastAnthemDate !== time.date) {
         if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
-            lastAnthemDate = todayKey;
-            currentNowPlaying = { title: "ΕΘΝΙΚΟΣ ΥΜΝΟΣ", genre: "Ειδική Μετάδοση" };
+            lastAnthemDate = time.date;
             return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
     }
 
-    // 2. Αναγγελία Ώρας
     if (lastAnnouncedHour !== time.hour) {
         const hourFile = findHourFile(time.hour);
         if (hourFile) {
             console.log(`[TIME CHIME] Βρέθηκε το αρχείο ώρας: ${hourFile}`);
             lastAnnouncedHour = time.hour;
             let hourString = time.hour < 10 ? `0${time.hour}.00` : `${time.hour}.00`;
-            currentNowPlaying = { title: `Η ώρα είναι ${hourString}`, genre: "Ώρα Ελλάδος" };
 
-            // Αν είναι η 00:00 της 1ης Ιανουαρίου, προγραμματίζουμε την υποχρεωτική Πρωτοχρονιάτικη ακολουθία
             if (time.hour === 0 && time.month === 0 && time.date === 1) {
                 const sequenceKey = `${time.year}-${time.date}`;
                 if (lastNewYearSequenceKey !== sequenceKey) {
-                    const nySequenceFiles = [
-                        'ΚαλήΧρονιά.mp3',
-                        'thavma_palmos_christmas_jingle.mp3',
-                        'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3'
-                    ];
+                    const nySequenceFiles = ['ΚαλήΧρονιά.mp3', 'thavma_palmos_christmas_jingle.mp3', 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3'];
                     newYearQueue = nySequenceFiles.filter(f => fs.existsSync(path.join(__dirname, f)));
                     lastNewYearSequenceKey = sequenceKey;
-                    console.log(`[NEW YEAR] Προγραμματίστηκε η Πρωτοχρονιάτικη ακολουθία (${newYearQueue.length} αρχεία).`);
+                    console.log(`[NEW YEAR] Προγραμματίστηκε η Πρωτοχρονιάτικη ακολουθία.`);
                 }
             }
-
             return { file: hourFile, title: `Η ώρα είναι ${hourString}`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
         }
     }
 
-    // 2.5 Υποχρεωτική Πρωτοχρονιάτικη ακολουθία (σε σειρά, πριν από οτιδήποτε άλλο)
     if (newYearQueue.length > 0) {
         const nextFile = newYearQueue.shift();
         if (fs.existsSync(path.join(__dirname, nextFile))) {
             let displayTitle = nextFile.replace('.mp3', '');
-            currentNowPlaying = { title: displayTitle, genre: "Πρωτοχρονιάτικη Ακολουθία" };
             return { file: nextFile, title: displayTitle, genreLabel: 'Πρωτοχρονιάτικη Ακολουθία', isSystem: true };
         }
     }
 
-    // 3. Jingle ανά 5 τραγούδια
     if (songCounter >= 5) {
         if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
             songCounter = 0;
-            currentNowPlaying = { title: "Thavma Παλμός Jingle", genre: "Σήμα Σταθμού" };
             return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
         }
     }
 
-    // 4. ΕΛΕΓΧΟΣ ΠΑΡΑΓΓΕΛΙΑΣ
-    // Η παραγγελιά έρχεται από το Supabase, όχι από local memory.
-    // Έτσι μπορεί να σταλεί από το site και να την πάρει το LIVE.
-    const supabaseRequest = await checkSupabaseRequest();
-
-    if (supabaseRequest) {
-        const requestedFile = supabaseRequest.filename;
-
-        let displayTitle = requestedFile
-            .replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '')
-            .replace(/\.mp3$/i, '')
-            .replace(/_/g, ' ');
-
-        const displayGenre = `Παραγγελία Ακροατή [${supabaseRequest.requester}]`;
-
+    const liveRequest = await checkSupabaseRequest();
+    if (liveRequest) {
+        let displayTitle = liveRequest.filename.replace(/^[A-ZZΠα-ωήίόύέώ\s]+\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
         return {
-            file: requestedFile,
+            file: liveRequest.filename,
             title: displayTitle,
-            genreLabel: displayGenre,
+            genreLabel: `Παραγγελιά Ακροατή [${liveRequest.requester}]`,
             isSong: true,
-            isRequest: true,
-            requestId: supabaseRequest.id
+            isRequest: true
         };
     }
 
-    // 5. Κανονικό Τραγούδι
     const files = fs.readdirSync(__dirname);
     let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
-
     if (mp3Files.length === 0) return null;
 
     const christmasActive = isChristmasPeriod(time.month, time.date);
-    const xFiles = mp3Files.filter(f => f.startsWith('(X)'));
-    // Όταν είναι ενεργή η χριστουγεννιάτικη περίοδος, η "κανονική" δεξαμενή τραγουδιών
-    // εξαιρεί προσωρινά τα (X) ώστε να ελέγχουμε εμείς με πιθανότητα πότε μπαίνουν.
-    const normalPool = christmasActive ? mp3Files.filter(f => !f.startsWith('(X)')) : mp3Files;
+    const xFiles = mp3Files.filter(f => hasTag(f, ...TAG.CHRISTMAS));
+    const normalPool = mp3Files.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
     let genreLabel = "Mix Πρόγραμμα";
 
     if (genre === 'B') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(B)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.BEATS));
         genreLabel = "Beats (Disco, Dance, Club)";
     } else if (genre === 'R') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(R)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.RADIO));
         genreLabel = "Radio (Κανονική Ροή)";
     } else if (genre === 'P_LZ') {
-        filteredFiles = normalPool.filter(f => f.startsWith('(Π)') || f.startsWith('(ΛΖ)'));
+        filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         genreLabel = "Παραδοσιακά & Λαϊκά";
-    } else if (genre === 'MIX_PREFER_P') {
-        let pFiles = normalPool.filter(f => f.startsWith('(Π)'));
-        if (pFiles.length > 0 && Math.random() < 0.7) filteredFiles = pFiles;
-        else filteredFiles = normalPool;
-        genreLabel = "Mix (Έμφαση στα Παραδοσιακά)";
+    } else if (genre === 'EASTER_MODE') {
+        const easterFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
+        if (easterFiles.length > 0 && Math.random() < 0.20) {
+            filteredFiles = easterFiles;
+            genreLabel = "Πασχαλινό Πρόγραμμα (Έμφαση στα Παραδοσιακά)";
+        } else {
+            filteredFiles = normalPool;
+            genreLabel = "Πασχαλινό Πρόγραμμα (Mix)";
+        }
     } else {
+        // genre === 'MIX': ΟΛΟΚΛΗΡΟ το normalPool, όλες οι κατηγορίες μαζί αδιάκριτα
         filteredFiles = normalPool;
         genreLabel = "Mix Πρόγραμμα";
     }
 
-    if (filteredFiles.length === 0) filteredFiles = normalPool;
+    if (filteredFiles.length === 0) filteredFiles = normalPool.length > 0 ? normalPool : mp3Files;
 
-    // Χριστουγεννιάτικη επιλογή (X)
     if (christmasActive && xFiles.length > 0) {
         const xBoost = isNewYearXBoostWindow(time.month, time.date, time.hour);
         const xProbability = xBoost ? 0.80 : 0.35;
-
         if (Math.random() < xProbability) {
-            // Αμιγώς χριστουγεννιάτικο τραγούδι
             filteredFiles = xFiles;
-            genreLabel = xBoost
-                ? "Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά"
-                : "Χριστουγεννιάτικο Πρόγραμμα (X)";
+            genreLabel = xBoost ? "Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά" : "Χριστουγεννιάτικο Πρόγραμμα (X)";
         } else {
-            // Αναμειγνύονται στη ροή του κανονικού προγράμματος
+            // Στο MIX εκτός boost, τα Χριστουγεννιάτικα ΠΡΟΣΤΙΘΕΝΤΑΙ στο υπόλοιπο mix
+            // (δηλ. κατά την περίοδο Χριστουγέννων, MIX = ΚΥΡΙΟΛΕΚΤΙΚΑ όλα μαζί, X included)
             filteredFiles = filteredFiles.concat(xFiles);
         }
     }
@@ -535,7 +395,6 @@ async function selectNextFile() {
     if (filteredFiles.length === 0) filteredFiles = mp3Files;
 
     let availableFiles = filteredFiles.filter(f => !globalPlayedSongs.includes(f));
-
     if (availableFiles.length === 0) {
         globalPlayedSongs = globalPlayedSongs.filter(f => !filteredFiles.includes(f));
         availableFiles = filteredFiles;
@@ -544,7 +403,6 @@ async function selectNextFile() {
     const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
     const now = Date.now();
     let randomFile;
-
     let availableNewFiles = availableFiles.filter(f => {
         const filePath = path.join(__dirname, f);
         return fs.existsSync(filePath) && (now - fs.statSync(filePath).mtimeMs) <= THREE_DAYS_MS;
@@ -557,24 +415,31 @@ async function selectNextFile() {
         randomFile = availableNewFiles[0];
         genreLabel = "ΝΕΟ ΤΡΑΓΟΥΔΙ! - " + genreLabel;
     } else {
-        randomFile = availableFiles[Math.floor(Math.random() * availableFiles.length)];
+        shuffleArray(availableFiles);
+        randomFile = availableFiles[0];
     }
 
     globalPlayedSongs.push(randomFile);
-
-    let displayTitle = randomFile.replace(/^\([A-ZΖΠα-ωήίόύέώ\s]+\)\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-
+    let displayTitle = randomFile.replace(/^[A-ZZΠα-ωήίόύέώ\s]+\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
     return { file: randomFile, title: displayTitle, genreLabel: genreLabel, isSong: true };
 }
 
-// ============================================================
-//  VISUAL COUNTDOWN & FX ΠΡΩΤΟΧΡΟΝΙΑΣ (31/12 23:50:00 -> 00:00:00)
-// ============================================================
-// Όλα τα offsets υπολογίζονται σε δευτερόλεπτα σχετικά με τη στιγμή εκκίνησης
-// της τρέχουσας ffmpeg διεργασίας (spawnTime). Μέσα στο φίλτρο, η μεταβλητή `t`
-// του FFmpeg είναι ακριβώς αυτά τα δευτερόλεπτα από την εκκίνηση, οπότε η αντιστοίχιση
-// είναι ακριβής ανεξάρτητα από το ποιο τραγούδι παίζει εκείνη τη στιγμή.
 function buildNewYearCountdownFilters(spawnTime) {
+    // ============================================================
+    // TEST MODE: Αν το env var TEST_NEWYEAR είναι 'true' (π.χ. από ένα
+    // χειροκίνητο workflow_dispatch run στο GitHub Actions), προσομοιώνουμε
+    // ΟΛΟΚΛΗΡΗ την ακολουθία αντίστροφης μέτρησης σε ~55 δευτερόλεπτα αντί να
+    // περιμένουμε πραγματικά την 31η Δεκεμβρίου. Δεν επηρεάζει ΚΑΘΟΛΟΥ τη
+    // λογική προγράμματος (getRequiredGenre/MIX) — μόνο το οπτικό εφέ αυτού
+    // του ffmpeg process. Μόλις τελειώσει το τεστ, το επόμενο run θα
+    // ξαναδουλεύει κανονικά, αφού το flag δεν παραμένει μόνιμα ενεργό.
+    if (process.env.TEST_NEWYEAR === 'true') {
+        return buildCountdownFromOffsets({
+            off2350: 5, off2359: 25, off235950: 35, offMidnight: 45, nyEnd: 55,
+            nextYear: spawnTime.year + 1
+        });
+    }
+
     const isDec31 = (spawnTime.month === 11 && spawnTime.date === 31);
     const isEarlyJan1 = (spawnTime.month === 0 && spawnTime.date === 1 && spawnTime.hour === 0 && spawnTime.minute === 0 && spawnTime.second < 20);
 
@@ -585,22 +450,23 @@ function buildNewYearCountdownFilters(spawnTime) {
     const target2350 = athensTargetDate(spawnTime, 0, 23, 50, 0);
     const target2359 = athensTargetDate(spawnTime, 0, 23, 59, 0);
     const target235950 = athensTargetDate(spawnTime, 0, 23, 59, 50);
-    const targetMidnight = isDec31
-        ? athensTargetDate(spawnTime, 1, 0, 0, 0)
-        : athensTargetDate(spawnTime, 0, 0, 0, 0);
+    const targetMidnight = isDec31 ? athensTargetDate(spawnTime, 1, 0, 0, 0) : athensTargetDate(spawnTime, 0, 0, 0, 0);
 
     const off2350 = secondsFromNowTo(spawnTime, target2350);
     const off2359 = secondsFromNowTo(spawnTime, target2359);
     const off235950 = secondsFromNowTo(spawnTime, target235950);
     const offMidnight = secondsFromNowTo(spawnTime, targetMidnight);
     const nextYear = isDec31 ? spawnTime.year + 1 : spawnTime.year;
+    const nyEnd = offMidnight + 10;
 
+    return buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear });
+}
+
+// Εξήχθη σε ξεχωριστή συνάρτηση ώστε να τη μοιράζονται το κανονικό flow και το TEST MODE.
+function buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear }) {
     const filters = [];
-
-    // Έκφραση υπολειπόμενου χρόνου (σε δευτερόλεπτα) μέχρι τα μεσάνυχτα, σε σχέση με το t του FFmpeg
     const remainingExpr = `(${offMidnight.toFixed(2)}-t)`;
 
-    // -------- ΦΑΣΗ Α: 23:50 -> 23:59, ανά λεπτό, μεγαλώνει το μέγεθος & γίνεται πιο χρυσαφί --------
     const goldSteps = ['white', '0xFFF5CC', '0xFFEDB0', '0xFFE494', '0xFFDC78', '0xFFD35C', '0xFFCB40', '0xFFD700', '0xFFD700'];
     for (let i = 0; i < 9; i++) {
         const start = off2350 + i * 60;
@@ -608,23 +474,17 @@ function buildNewYearCountdownFilters(spawnTime) {
         const fontsize = 42 + i * 7;
         const color = goldSteps[i];
         const countdownText = `%{eif\\:trunc(${remainingExpr}/60)\\:d\\:2}\\:%{eif\\:mod(trunc(${remainingExpr})\\,60)\\:d\\:2}`;
-        filters.push(
-            `drawtext=${FONT_ARG}text='${countdownText}':x=(w-text_w)/2:y=90:fontsize=${fontsize}:fontcolor=${color}:box=1:boxcolor=black@0.55:boxborderw=12:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`
-        );
+        filters.push(`drawtext=${FONT_ARG}text='${countdownText}':x=(w-text_w)/2:y=90:fontsize=${fontsize}:fontcolor=${color}:box=1:boxcolor=black@0.55:boxborderw=12:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
-    // -------- ΦΑΣΗ Β: 23:59:00 -> 23:59:50, μαύρη οθόνη + pulse ανά δευτερόλεπτο --------
     for (let i = 0; i < 50; i++) {
         const start = off2359 + i;
         const end = off2359 + i + 1;
         const fontsize = i % 2 === 0 ? 130 : 150;
         const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:2}`;
-        filters.push(
-            `drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=0xFFD700:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`
-        );
+        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=0xFFD700:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
-    // -------- ΦΑΣΗ Γ: 23:59:50 -> 23:59:59, τελευταία 10", "τρελό" έντονο pulse --------
     const crazyColors = ['0xFFD700', '0xFFFFFF'];
     for (let i = 0; i < 10; i++) {
         const start = off235950 + i;
@@ -632,45 +492,30 @@ function buildNewYearCountdownFilters(spawnTime) {
         const fontsize = i % 2 === 0 ? 190 : 220;
         const color = crazyColors[i % 2];
         const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:1}`;
-        filters.push(
-            `drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`
-        );
+        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
-    // -------- ΦΑΣΗ Δ: 00:00:00, "Καλή Χρονιά {έτος}!" + απλά fireworks --------
-    const nyStart = offMidnight;
-    const nyEnd = offMidnight + 10;
-    const nyText = `Καλή Χρονιά ${nextYear}!`.replace(/'/g, '’');
-    filters.push(
-        `drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${nyStart.toFixed(2)}\\,${nyEnd.toFixed(2)})'`
-    );
-
-    // Απλό "fireworks" εφέ χωρίς εξωτερικό asset: μερικές αστεράκι-εκρήξεις σε διαφορετικά σημεία,
-    // η καθεμία εμφανίζεται στιγμιαία λίγο μετά τα μεσάνυχτα.
-    const burstPoints = [
-        { x: 'w*0.15', y: 'h*0.25', delay: 0.3 },
-        { x: 'w*0.85', y: 'h*0.20', delay: 0.9 },
-        { x: 'w*0.25', y: 'h*0.75', delay: 1.6 },
-        { x: 'w*0.75', y: 'h*0.70', delay: 2.3 },
-        { x: 'w*0.50', y: 'h*0.15', delay: 3.0 },
-    ];
-    burstPoints.forEach((b, idx) => {
-        const bStart = offMidnight + b.delay;
-        const bEnd = bStart + 1.2;
-        const color = idx % 2 === 0 ? '0xFFD700' : '0xFF4444';
-        filters.push(
-            `drawtext=${FONT_ARG}text='✦':x=${b.x}:y=${b.y}:fontsize=80:fontcolor=${color}:enable='between(t\\,${bStart.toFixed(2)}\\,${bEnd.toFixed(2)})'`
-        );
-    });
+    const nyText = `Καλή Χρονιά ${nextYear}!`.replace(/'/g, '');
+    filters.push(`drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${offMidnight.toFixed(2)}\\,${nyEnd.toFixed(2)})'`);
 
     return {
         filters,
         blackoutStart: off2359,
         blackoutEnd: offMidnight,
-        // Κρύβουμε τα κανονικά label/title/clock overlays κατά το blackout & λίγο μετά τα μεσάνυχτα
         suppressNormalOverlayFrom: off2359,
         suppressNormalOverlayUntil: nyEnd
     };
+}
+
+function athensTargetDate(spawnTime, daysFromNow, hour, minute, second) {
+    const target = new Date(spawnTime.raw);
+    target.setDate(target.getDate() + daysFromNow);
+    target.setHours(hour, minute, second, 0);
+    return target;
+}
+
+function secondsFromNowTo(spawnTime, targetDate) {
+    return Math.max(0, (targetDate - spawnTime.raw) / 1000);
 }
 
 async function startNextMedia() {
@@ -686,15 +531,21 @@ async function startNextMedia() {
     if (media.isHourAnnouncement) songCounter = 0;
     else if (media.isSong && !media.isRequest) songCounter++;
 
-    currentNowPlaying = { title: media.title, genre: media.genreLabel };
+currentNowPlaying = { title: media.title, genre: media.genreLabel };
 
-    const streamKey = process.env.YOUTUBE_STREAM_KEY;
-    if (!streamKey) {
-        setTimeout(startNextMedia, 5000);
-        return;
+    // ΝΕΟ: Γράφει το "τώρα παίζει" στο Supabase ώστε το site (Netlify) να το
+    // διαβάζει ΑΠΕΥΘΕΙΑΣ, χωρίς να χρειάζεται δημόσιο URL για το Node server.
+    if (supabase) {
+        supabase.from('station_status').upsert({
+            id: 1,
+            title: media.title,
+            genre: media.genreLabel,
+            updated_at: new Date().toISOString()
+        }).then(({ error }) => {
+            if (error) console.error('[STATUS SYNC ERROR]', error.message);
+        });
     }
 
-    // ΑΠΟΛΥΤΟΣ ΚΑΘΑΡΙΣΜΟΣ: Αντικατάσταση του : και , με ασφαλείς χαρακτήρες για το FFmpeg
     const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, " — ").replace(/,/g, " ");
     const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, ".").replace(/,/g, " ");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
@@ -702,66 +553,74 @@ async function startNextMedia() {
     const spawnTime = getGreekTime();
     const ny = buildNewYearCountdownFilters(spawnTime);
 
-    // Αν υπάρχει ενεργό "blackout" παράθυρο (23:59:00 -> 00:00:00), βάζουμε μαύρο drawbox
-    // πάνω από το background.jpg, ώστε να μείνουν μόνο οι αριθμοί/το κείμενο ορατά.
     let blackoutFilter = '';
     if (ny.blackoutStart !== null) {
         blackoutFilter = `,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t\\,${ny.blackoutStart.toFixed(2)}\\,${ny.blackoutEnd.toFixed(2)})'`;
     }
 
-    // Τα κανονικά overlays (label/title/clock) κρύβονται όσο διαρκεί το blackout + λίγο μετά τα μεσάνυχτα
     let normalOverlayEnable = '';
     if (ny && ny.suppressNormalOverlayFrom !== undefined && ny.suppressNormalOverlayFrom !== null) {
         normalOverlayEnable = `:enable='not(between(t\\,${ny.suppressNormalOverlayFrom.toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
+    // Γραμματοσειρές: κατηγορία/τίτλος μικρότερα & πιο αριστερά (κοντά σε στυλ Century)
     const baseOverlayFilters =
-        `drawtext=${FONT_ARG}text='${cleanLabel}':x=30:y=30:fontsize=20:fontcolor=yellow:box=1:boxcolor=black@0.6:boxborderw=8${normalOverlayEnable}, ` +
-        `drawtext=${FONT_ARG}text='${cleanTitle}':x=30:y=65:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=10${normalOverlayEnable}, ` +
-        `drawtext=${FONT_ARG}text='${clockText}':x=w-tw-30:y=30:fontsize=20:fontcolor=black${normalOverlayEnable}`;
+        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=22:fontsize=15:fontcolor=yellow:box=1:boxcolor=black@0.55:boxborderw=6${normalOverlayEnable},` +
+        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=50:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=7${normalOverlayEnable},` +
+        `drawtext=fontfile='${TIME_FONT}':text='${clockText}':x=w-tw-20:y=22:fontsize=18:fontcolor=black${normalOverlayEnable}`;
 
     const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(', ') : '';
+    const vfChain = `scale=854:480${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
 
-    const vfChain =
-        `scale=1280:720${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
-
-    // ΣΤΡΩΤΗ ΡΟΗ: Το -fflags μπήκε πρώτο, και το -re μπήκε αποκλειστικά στον ήχο για να παίζουν σωστά τα μικρά αρχεία
+    const streamKey = process.env.YOUTUBE_STREAM_KEY;
     const ffmpeg = spawn('ffmpeg', [
-        '-re',
-        '-fflags', '+genpts',
-        '-loop', '1', '-framerate', '2', '-i', 'background.jpg',
-        '-i', path.join(__dirname, media.file),
+        '-re', '-fflags', '+genpts', '-loop', '1', '-framerate', '12', '-i', 'background.jpg',
+        '-i', media.file,
         '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
         '-vf', vfChain,
-        '-r', '15', '-g', '30', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
-        '-c:a', 'aac', '-b:a', '128k', '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
+        '-r', '12', '-g', '24', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-af', 'aresample=async=1:min_hard_comp=0.100000:first_pts=0',
+        '-max_muxing_queue_size', '4096',
+        '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
         `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
-    ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    ], { stdio: 'ignore' });
 
-    // Μόλις ξεκινήσει το FFmpeg χωρίς άμεσο spawn error, η παραγγελιά
-    // θεωρείται ότι μπήκε στο LIVE και μπορεί να γίνει played.
-    if (media.isRequest && media.requestId) {
-        ffmpeg.once('spawn', () => {
-            markSupabaseRequestPlayed(media.requestId).catch(error => {
-                console.error('[SUPABASE REQUEST PLAYED ERROR]', error.message);
-            });
-        });
-    }
-
-    ffmpeg.stderr.on('data', data => {
-        const message = data.toString().trim();
-        if (message && message.toLowerCase().includes('error')) {
-            console.error('[FFMPEG ERROR]', message);
-        }
-    });
+    currentFfmpegProcess = ffmpeg;
 
     ffmpeg.on('close', () => {
-        setImmediate(startNextMedia);
+        currentFfmpegProcess = null;
+        if (!isShuttingDown) startNextMedia();
     });
-
-    ffmpeg.on('error', error => {
-        console.error('[FFMPEG SPAWN ERROR]', error.message);
-        setTimeout(startNextMedia, 1000);
+    ffmpeg.on('error', () => {
+        currentFfmpegProcess = null;
+        if (!isShuttingDown) startNextMedia();
     });
 }
+
+function gracefulShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[SHUTDOWN] Λήψη σήματος ${signal} — ήρεμος τερματισμός για seamless handover.`);
+    if (currentFfmpegProcess) {
+        currentFfmpegProcess.kill('SIGTERM');
+    }
+    setTimeout(() => process.exit(0), 2000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+app.listen(PORT, '0.0.0.0', async () => {
+    console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
+    await syncSongsToSupabase();
+    startNextMedia();
+});
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+}
+
