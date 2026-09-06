@@ -23,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
 
       - name: Install dependencies
         run: npm install express @supabase/supabase-js nodemailer
@@ -36,16 +36,21 @@ jobs:
           fi
           ffmpeg -version | head -n 1
 
+      - name: Ensure fallback fonts (Liberation) are installed
+        run: |
+          if [ ! -f /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf ]; then
+            sudo apt-get update -y
+            sudo apt-get install -y fonts-liberation
+          fi
+
       - name: Install custom fonts
         run: |
           mkdir -p /usr/share/fonts/truetype/custom
           if [ -d "./fonts" ]; then
             sudo cp ./fonts/*.ttf /usr/share/fonts/truetype/custom/ 2>/dev/null || true
             sudo fc-cache -f -v /usr/share/fonts/truetype/custom/
-            echo "Custom fonts installed:"
-            ls -la /usr/share/fonts/truetype/custom/
           else
-            echo "No fonts folder found - using default fonts"
+            echo "No fonts folder found - using Liberation fallback"
           fi
 
       - name: Run 24/7 radio stream
