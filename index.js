@@ -12,6 +12,20 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav']);
+
+function isAudioFile(fileName) {
+    return AUDIO_EXTENSIONS.has(path.extname(String(fileName || '')).toLowerCase());
+}
+
+function findNamedAudio(baseName) {
+    for (const ext of ['.mp3', '.wav']) {
+        const candidate = `${baseName}${ext}`;
+        if (fs.existsSync(path.join(__dirname, candidate))) return candidate;
+    }
+    return null;
+}
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
@@ -74,14 +88,14 @@ async function syncSongsToSupabase() {
     if (!supabase) return;
     try {
         const files = fs.readdirSync(__dirname);
-        const mp3Files = files
-            .filter(f => path.extname(f).toLowerCase() === '.mp3' && !isHourFile(f))
+        const audioFiles = files
+            .filter(f => isAudioFile(f) && !isHourFile(f))
             .sort((a, b) => a.localeCompare(b, 'el'));
 
         const syncedAt = new Date().toISOString();
-        if (mp3Files.length > 0) {
+        if (audioFiles.length > 0) {
             const { error: upsertError } = await supabase.from('songs').upsert(
-                mp3Files.map(f => ({ filename: f, synced_at: syncedAt })),
+                audioFiles.map(f => ({ filename: f, synced_at: syncedAt })),
                 { onConflict: 'filename' }
             );
             if (upsertError) throw upsertError;
@@ -92,7 +106,7 @@ async function syncSongsToSupabase() {
         const { data: dbSongs, error: listError } = await supabase.from('songs').select('filename');
         if (listError) throw listError;
 
-        const localSet = new Set(mp3Files);
+        const localSet = new Set(audioFiles);
         const stale = (dbSongs || []).map(r => r.filename).filter(Boolean).filter(f => !localSet.has(f));
         if (stale.length > 0) {
             const { error: deleteError } = await supabase.from('songs').delete().in('filename', stale);
@@ -100,7 +114,7 @@ async function syncSongsToSupabase() {
             console.log(`[SUPABASE SYNC] Αφαιρέθηκαν ${stale.length} παλιά entries από το songs.`);
         }
 
-        console.log(`[SUPABASE SYNC] Η λίστα songs είναι ακριβές mirror των ${mp3Files.length} τοπικών τραγουδιών.`);
+        console.log(`[SUPABASE SYNC] Η λίστα songs είναι ακριβές mirror των ${audioFiles.length} τοπικών MP3/WAV τραγουδιών.`);
     } catch (error) {
         console.error('[SYNC ERROR]', error.message);
     }
@@ -121,7 +135,7 @@ async function checkSupabaseRequest() {
 
         const files = fs.readdirSync(__dirname);
         const match = files.find(f =>
-            path.extname(f).toLowerCase() === '.mp3' &&
+            isAudioFile(f) &&
             f.toLowerCase() === String(request.song || '').toLowerCase()
         );
 
@@ -177,15 +191,18 @@ function getGreekTime() {
 }
 
 function findHourFile(hour) {
-    const hourFileName = `clock${hour}.mp3`;
-    return fs.existsSync(path.join(__dirname, hourFileName)) ? hourFileName : null;
+    return findNamedAudio(`clock${hour}`);
 }
 
 function isHourFile(fileName) {
-    if (fileName === 'thavma_palmos_jingle.mp3' || fileName === 'ethnikos_ymnos.mp3') return true;
-    if (fileName === 'ΚαλήΧρονιά.mp3' || fileName === 'thavma_palmos_christmas_jingle.mp3') return true;
-    if (fileName === 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3') return true;
-    return /^clock\d+\.mp3$/.test(fileName);
+    const ext = path.extname(String(fileName || '')).toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) return false;
+
+    const base = path.basename(fileName, ext);
+    if (base === 'thavma_palmos_jingle' || base === 'ethnikos_ymnos') return true;
+    if (base === 'ΚαλήΧρονιά' || base === 'thavma_palmos_christmas_jingle') return true;
+    if (base === 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19') return true;
+    return /^clock\d+$/.test(base);
 }
 
 function isChristmasPeriod(month, date) {
@@ -267,7 +284,7 @@ function sleep(ms) {
 function cleanDisplayTitle(filename) {
     return String(filename || '')
         .replace(/^\([^)]+\)\s*/, '')
-        .replace(/\.mp3$/i, '')
+        .replace(/\.(mp3|wav)$/i, '')
         .replace(/_/g, ' ')
         .trim();
 }
@@ -400,13 +417,14 @@ async function prepareNewYearSequence(time) {
         seq.push({ file: clock0, title: 'Η ώρα είναι 00.00', genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true });
     }
 
-    const specialFiles = [
-        'ΚαλήΧρονιά.mp3',
-        'thavma_palmos_christmas_jingle.mp3',
-        'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3'
+    const specialBaseNames = [
+        'ΚαλήΧρονιά',
+        'thavma_palmos_christmas_jingle',
+        'Αρχιμηνιά και Αρχιχρονιά το λάδι 19'
     ];
-    for (const file of specialFiles) {
-        if (fs.existsSync(path.join(__dirname, file))) {
+    for (const baseName of specialBaseNames) {
+        const file = findNamedAudio(baseName);
+        if (file) {
             seq.push({ file, title: cleanDisplayTitle(file), genreLabel: 'Πρωτοχρονιάτικη Ακολουθία', isSystem: true });
         }
     }
@@ -469,9 +487,10 @@ async function selectNextFile() {
     }
 
     if (time.hour === 0 && lastAnthemDate !== time.date) {
-        if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
+        const anthemFile = findNamedAudio('ethnikos_ymnos');
+        if (anthemFile) {
             lastAnthemDate = time.date;
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
+            return { file: anthemFile, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
     }
 
@@ -486,9 +505,10 @@ async function selectNextFile() {
     }
 
     if (songCounter >= 5) {
-        if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
+        const jingleFile = findNamedAudio('thavma_palmos_jingle');
+        if (jingleFile) {
             songCounter = 0;
-            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
+            return { file: jingleFile, title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
         }
     }
 
@@ -505,12 +525,12 @@ async function selectNextFile() {
     }
 
     const files = fs.readdirSync(__dirname);
-    const mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
-    if (mp3Files.length === 0) return null;
+    const audioFiles = files.filter(file => isAudioFile(file) && !isHourFile(file));
+    if (audioFiles.length === 0) return null;
 
     const christmasActive = isChristmasPeriod(time.month, time.date);
-    const xFiles = mp3Files.filter(f => hasTag(f, ...TAG.CHRISTMAS));
-    const normalPool = mp3Files.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
+    const xFiles = audioFiles.filter(f => hasTag(f, ...TAG.CHRISTMAS));
+    const normalPool = audioFiles.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
@@ -547,7 +567,7 @@ async function selectNextFile() {
     }
 
     if (filteredFiles.length === 0) {
-        filteredFiles = normalPool.length > 0 ? normalPool : mp3Files;
+        filteredFiles = normalPool.length > 0 ? normalPool : audioFiles;
         rotationKey = 'MIX';
         genreLabel = 'Mix Πρόγραμμα';
     }
