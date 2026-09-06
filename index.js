@@ -30,9 +30,6 @@ const transporter = nodemailer.createTransport({
 });
 
 app.post('/api/request-song', async (req, res) => {
-    // ΝΕΑ πεδία: category (προαιρετικό), deviceId (υποχρεωτικό, από το frontend
-    // localStorage), vipCode (προαιρετικό — "TP26" παρακάμπτει το όριο 30 λεπτών).
-    // Το email έγινε προαιρετικό αφού η φόρμα του site δεν το ζητάει πλέον.
     const { song, requester, category, email, deviceId, vipCode } = req.body;
     if (!song || !requester || !deviceId) {
         return res.status(400).json({ error: 'Λείπουν υποχρεωτικά πεδία (όνομα, τραγούδι, deviceId)' });
@@ -45,7 +42,6 @@ app.post('/api/request-song', async (req, res) => {
 
     try {
         if (!isVip) {
-            // Έλεγχος ορίου 30 λεπτών ανά συσκευή (deviceId)
             const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
             const { data: recent, error: recentErr } = await supabase
                 .from('song_requests')
@@ -109,7 +105,10 @@ async function checkSupabaseRequest() {
             .limit(1);
         if (error || !data || data.length === 0) return null;
         const request = data[0];
-        await supabase.from('song_requests').update({ status: 'processed' }).eq('id', request.id);
+        const { error: updateErr } = await supabase.from('song_requests').update({ status: 'processed' }).eq('id', request.id);
+        if (updateErr) {
+            console.error('[REQUEST UPDATE ERROR — ΘΑ ΞΑΝΑΠΑΙΞΕΙ ΤΟ ΙΔΙΟ ΑΙΤΗΜΑ!]', updateErr.message);
+        }
         const files = fs.readdirSync(__dirname);
         const match = files.find(f => f.toLowerCase().includes(request.song.toLowerCase()) && path.extname(f).toLowerCase() === '.mp3');
         if (match) {
@@ -191,35 +190,31 @@ function isEasterPeriod(time) {
 
 function getRequiredGenre() {
     const time = getGreekTime();
-    const d = time.day; // 0: Κυριακή, 1: Δευτέρα, ..., 6: Σάββατο
+    const d = time.day;
     const h = time.hour;
 
-    // Πασχαλινό Mode (εφόσον είναι ενεργό)
     if (isEasterPeriod(time)) {
         return 'EASTER_MODE';
     }
 
-    // Σαββατοκύριακο (0 = Κυριακή, 6 = Σάββατο): Όλη μέρα Mix Πρόγραμμα
     if (d === 0 || d === 6) {
         return 'MIX';
     }
 
-    // Δευτέρα (1), Τετάρτη (3), Παρασκευή (5)
     if (d === 1 || d === 3 || d === 5) {
-        if (h >= 2 && h < 7) return 'B';     // 02:00 – 07:00 | Beats
-        if (h >= 7 && h < 12) return 'R';    // 07:00 – 12:00 | Radio
-        if (h >= 12 && h < 17) return 'P_LZ';// 12:00 – 17:00 | Παραδοσιακά & Λαϊκά
-        if (h >= 17 && h < 20) return 'R';    // 17:00 – 20:00 | Radio
-        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
+        if (h >= 2 && h < 7) return 'B';
+        if (h >= 7 && h < 12) return 'R';
+        if (h >= 12 && h < 17) return 'P_LZ';
+        if (h >= 17 && h < 20) return 'R';
+        return 'MIX';
     }
 
-    // Τρίτη (2), Πέμπτη (4)
     if (d === 2 || d === 4) {
-        if (h >= 2 && h < 8) return 'B';     // 02:00 – 08:00 | Beats  ← ΔΙΟΡΘΩΘΗΚΕ (ήταν 0)
-        if (h >= 8 && h < 12) return 'R';    // 08:00 – 12:00 | Radio
-        if (h >= 12 && h < 16) return 'P_LZ';// 12:00 – 16:00 | Παραδοσιακά & Λαϊκά
-        if (h >= 16 && h < 20) return 'R';    // 16:00 – 20:00 | Radio
-        return 'MIX';                         // 20:00 – 02:00 | Mix Πρόγραμμα
+        if (h >= 2 && h < 8) return 'B';
+        if (h >= 8 && h < 12) return 'R';
+        if (h >= 12 && h < 16) return 'P_LZ';
+        if (h >= 16 && h < 20) return 'R';
+        return 'MIX';
     }
 
     return 'MIX';
@@ -257,12 +252,26 @@ const TAG = {
     CHRISTMAS: ['X']
 };
 
-const FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-if (fs.existsSync(FONT_PATH)) {
-    console.log('[FONT] Χρήση γραμματοσειράς: ' + FONT_PATH);
-} else {
-    console.warn('[FONT WARNING] Δεν βρέθηκε η γραμματοσειρά.');
+function firstExisting(paths) {
+    for (const p of paths) {
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
 }
+
+const FALLBACK_REGULAR = firstExisting([
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+]) || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+
+const FALLBACK_BOLD = firstExisting([
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+]) || FALLBACK_REGULAR;
+
+const FONT_PATH = FALLBACK_REGULAR;
+console.log('[FONT] Εφεδρική γραμματοσειρά (regular): ' + FALLBACK_REGULAR);
+console.log('[FONT] Εφεδρική γραμματοσειρά (bold): ' + FALLBACK_BOLD);
 
 const FONT_ARG = FONT_PATH ? `fontfile='${FONT_PATH}':` : '';
 
@@ -276,9 +285,9 @@ function resolveNamedFont(candidateFileNames) {
     return null;
 }
 
-const TIME_FONT = resolveNamedFont(['Century.ttf', 'CENTURY.TTF', 'Century Regular.ttf']) || FONT_PATH;
-const TITLE_FONT = resolveNamedFont(['CenturyGothic.ttf', 'GOTHIC.TTF', 'Century Gothic.ttf']) || FONT_PATH;
-const CATEGORY_FONT = resolveNamedFont(['CenturyGothicBold.ttf', 'GOTHICB.TTF', 'Century Gothic Bold.ttf']) || FONT_PATH;
+const TIME_FONT = resolveNamedFont(['Century.ttf', 'CENTURY.TTF', 'Century Regular.ttf']) || FALLBACK_REGULAR;
+const TITLE_FONT = resolveNamedFont(['CenturyGothic.ttf', 'GOTHIC.TTF', 'Century Gothic.ttf']) || FALLBACK_REGULAR;
+const CATEGORY_FONT = resolveNamedFont(['CenturyGothicBold.ttf', 'GOTHICB.TTF', 'Century Gothic Bold.ttf']) || FALLBACK_BOLD;
 
 function isNewYearXBoostWindow(month, date, hour) {
     return month === 0 && date === 1 && hour >= 0 && hour < 2;
@@ -372,7 +381,6 @@ async function selectNextFile() {
             genreLabel = "Πασχαλινό Πρόγραμμα (Mix)";
         }
     } else {
-        // genre === 'MIX': ΟΛΟΚΛΗΡΟ το normalPool, όλες οι κατηγορίες μαζί αδιάκριτα
         filteredFiles = normalPool;
         genreLabel = "Mix Πρόγραμμα";
     }
@@ -386,8 +394,6 @@ async function selectNextFile() {
             filteredFiles = xFiles;
             genreLabel = xBoost ? "Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά" : "Χριστουγεννιάτικο Πρόγραμμα (X)";
         } else {
-            // Στο MIX εκτός boost, τα Χριστουγεννιάτικα ΠΡΟΣΤΙΘΕΝΤΑΙ στο υπόλοιπο mix
-            // (δηλ. κατά την περίοδο Χριστουγέννων, MIX = ΚΥΡΙΟΛΕΚΤΙΚΑ όλα μαζί, X included)
             filteredFiles = filteredFiles.concat(xFiles);
         }
     }
@@ -420,19 +426,12 @@ async function selectNextFile() {
     }
 
     globalPlayedSongs.push(randomFile);
+    logPlayHistory(randomFile);
     let displayTitle = randomFile.replace(/^[A-ZZΠα-ωήίόύέώ\s]+\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
     return { file: randomFile, title: displayTitle, genreLabel: genreLabel, isSong: true };
 }
 
 function buildNewYearCountdownFilters(spawnTime) {
-    // ============================================================
-    // TEST MODE: Αν το env var TEST_NEWYEAR είναι 'true' (π.χ. από ένα
-    // χειροκίνητο workflow_dispatch run στο GitHub Actions), προσομοιώνουμε
-    // ΟΛΟΚΛΗΡΗ την ακολουθία αντίστροφης μέτρησης σε ~55 δευτερόλεπτα αντί να
-    // περιμένουμε πραγματικά την 31η Δεκεμβρίου. Δεν επηρεάζει ΚΑΘΟΛΟΥ τη
-    // λογική προγράμματος (getRequiredGenre/MIX) — μόνο το οπτικό εφέ αυτού
-    // του ffmpeg process. Μόλις τελειώσει το τεστ, το επόμενο run θα
-    // ξαναδουλεύει κανονικά, αφού το flag δεν παραμένει μόνιμα ενεργό.
     if (process.env.TEST_NEWYEAR === 'true') {
         return buildCountdownFromOffsets({
             off2350: 5, off2359: 25, off235950: 35, offMidnight: 45, nyEnd: 55,
@@ -462,7 +461,6 @@ function buildNewYearCountdownFilters(spawnTime) {
     return buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear });
 }
 
-// Εξήχθη σε ξεχωριστή συνάρτηση ώστε να τη μοιράζονται το κανονικό flow και το TEST MODE.
 function buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear }) {
     const filters = [];
     const remainingExpr = `(${offMidnight.toFixed(2)}-t)`;
@@ -471,32 +469,37 @@ function buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, n
     for (let i = 0; i < 9; i++) {
         const start = off2350 + i * 60;
         const end = off2350 + (i + 1) * 60;
+        if (end <= 0) continue;
         const fontsize = 42 + i * 7;
         const color = goldSteps[i];
         const countdownText = `%{eif\\:trunc(${remainingExpr}/60)\\:d\\:2}\\:%{eif\\:mod(trunc(${remainingExpr})\\,60)\\:d\\:2}`;
-        filters.push(`drawtext=${FONT_ARG}text='${countdownText}':x=(w-text_w)/2:y=90:fontsize=${fontsize}:fontcolor=${color}:box=1:boxcolor=black@0.55:boxborderw=12:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
+        filters.push(`drawtext=${FONT_ARG}text='${countdownText}':x=(w-text_w)/2:y=90:fontsize=${fontsize}:fontcolor=${color}:box=1:boxcolor=black@0.55:boxborderw=12:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
     for (let i = 0; i < 50; i++) {
         const start = off2359 + i;
         const end = off2359 + i + 1;
+        if (end <= 0) continue;
         const fontsize = i % 2 === 0 ? 130 : 150;
         const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:2}`;
-        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=0xFFD700:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
+        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=0xFFD700:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
     const crazyColors = ['0xFFD700', '0xFFFFFF'];
     for (let i = 0; i < 10; i++) {
         const start = off235950 + i;
         const end = off235950 + i + 1;
+        if (end <= 0) continue;
         const fontsize = i % 2 === 0 ? 190 : 220;
         const color = crazyColors[i % 2];
         const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:1}`;
-        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${start.toFixed(2)}\\,${end.toFixed(2)})'`);
+        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
     }
 
     const nyText = `Καλή Χρονιά ${nextYear}!`.replace(/'/g, '');
-    filters.push(`drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${offMidnight.toFixed(2)}\\,${nyEnd.toFixed(2)})'`);
+    if (nyEnd > 0) {
+        filters.push(`drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${Math.max(0, offMidnight).toFixed(2)}\\,${nyEnd.toFixed(2)})'`);
+    }
 
     return {
         filters,
@@ -515,7 +518,7 @@ function athensTargetDate(spawnTime, daysFromNow, hour, minute, second) {
 }
 
 function secondsFromNowTo(spawnTime, targetDate) {
-    return Math.max(0, (targetDate - spawnTime.raw) / 1000);
+    return (targetDate - spawnTime.raw) / 1000;
 }
 
 async function startNextMedia() {
@@ -531,10 +534,8 @@ async function startNextMedia() {
     if (media.isHourAnnouncement) songCounter = 0;
     else if (media.isSong && !media.isRequest) songCounter++;
 
-currentNowPlaying = { title: media.title, genre: media.genreLabel };
+    currentNowPlaying = { title: media.title, genre: media.genreLabel };
 
-    // ΝΕΟ: Γράφει το "τώρα παίζει" στο Supabase ώστε το site (Netlify) να το
-    // διαβάζει ΑΠΕΥΘΕΙΑΣ, χωρίς να χρειάζεται δημόσιο URL για το Node server.
     if (supabase) {
         supabase.from('station_status').upsert({
             id: 1,
@@ -546,6 +547,12 @@ currentNowPlaying = { title: media.title, genre: media.genreLabel };
         });
     }
 
+    const streamKey = process.env.YOUTUBE_STREAM_KEY;
+    if (!streamKey) {
+        setTimeout(startNextMedia, 5000);
+        return;
+    }
+
     const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, " — ").replace(/,/g, " ");
     const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, ".").replace(/,/g, " ");
     const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
@@ -554,16 +561,15 @@ currentNowPlaying = { title: media.title, genre: media.genreLabel };
     const ny = buildNewYearCountdownFilters(spawnTime);
 
     let blackoutFilter = '';
-    if (ny.blackoutStart !== null) {
-        blackoutFilter = `,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t\\,${ny.blackoutStart.toFixed(2)}\\,${ny.blackoutEnd.toFixed(2)})'`;
+    if (ny.blackoutStart !== null && ny.blackoutEnd > 0) {
+        blackoutFilter = `,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t\\,${Math.max(0, ny.blackoutStart).toFixed(2)}\\,${ny.blackoutEnd.toFixed(2)})'`;
     }
 
     let normalOverlayEnable = '';
-    if (ny && ny.suppressNormalOverlayFrom !== undefined && ny.suppressNormalOverlayFrom !== null) {
-        normalOverlayEnable = `:enable='not(between(t\\,${ny.suppressNormalOverlayFrom.toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
+    if (ny && ny.suppressNormalOverlayFrom !== undefined && ny.suppressNormalOverlayFrom !== null && ny.suppressNormalOverlayUntil > 0) {
+        normalOverlayEnable = `:enable='not(between(t\\,${Math.max(0, ny.suppressNormalOverlayFrom).toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
-    // Γραμματοσειρές: κατηγορία/τίτλος μικρότερα & πιο αριστερά (κοντά σε στυλ Century)
     const baseOverlayFilters =
         `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=22:fontsize=15:fontcolor=yellow:box=1:boxcolor=black@0.55:boxborderw=6${normalOverlayEnable},` +
         `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=50:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=7${normalOverlayEnable},` +
@@ -572,7 +578,6 @@ currentNowPlaying = { title: media.title, genre: media.genreLabel };
     const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(', ') : '';
     const vfChain = `scale=854:480${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
 
-    const streamKey = process.env.YOUTUBE_STREAM_KEY;
     const ffmpeg = spawn('ffmpeg', [
         '-re', '-fflags', '+genpts', '-loop', '1', '-framerate', '12', '-i', 'background.jpg',
         '-i', media.file,
@@ -609,18 +614,36 @@ function gracefulShutdown(signal) {
     setTimeout(() => process.exit(0), 2000);
 }
 
+async function loadRecentPlayHistory() {
+    if (!supabase) return;
+    try {
+        const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+        const { data, error } = await supabase
+            .from('play_history')
+            .select('filename')
+            .gte('played_at', threeHoursAgo);
+        if (error) throw error;
+        if (data && data.length > 0) {
+            globalPlayedSongs = [...new Set(data.map(r => r.filename))];
+            console.log(`[HISTORY] Φορτώθηκαν ${globalPlayedSongs.length} πρόσφατα τραγούδια από άλλο job.`);
+        }
+    } catch (error) {
+        console.error('[HISTORY LOAD ERROR]', error.message);
+    }
+}
+
+function logPlayHistory(filename) {
+    if (!supabase) return;
+    supabase.from('play_history').insert([{ filename, played_at: new Date().toISOString() }])
+        .then(({ error }) => { if (error) console.error('[HISTORY LOG ERROR]', error.message); });
+}
+
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
     await syncSongsToSupabase();
+    await loadRecentPlayHistory();
     startNextMedia();
 });
-function shuffleArray(array) {
-    for (let i = array.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [array[i], array[j]] = [array[j], array[i]];
-    }
-}
-
