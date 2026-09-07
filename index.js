@@ -491,11 +491,11 @@ async function checkSupabaseRequest() {
             }
             if (!claimRows?.length) continue;
 
-            const claimedRequest = claimRows[0];
-            const category = extractTag(claimedRequest.song) || claimedRequest.category || '';
+            const targetSongFile = claimedRequest.song || ''; 
+            const category = extractTag(targetSongFile) || claimedRequest.category || '';
             const categoryRow = categorySettings.get(category);
-            const songRow = songSettings.get(claimedRequest.song);
-
+            const songRow = songSettings.get(targetSongFile);
+            
             if (categoryRow?.is_locked) {
                 await markRequestSkipped(claimedRequest.id, 'category_locked', categoryRow.lock_reason || 'Η κατηγορία κλειδώθηκε από admin.');
                 continue;
@@ -1005,6 +1005,9 @@ async function startNextMedia() {
 
     if (media.isHourAnnouncement) songCounter = 0;
     else if (media.isSong && !media.isRequest) songCounter++;
+
+    // ΠΡΟΣΘΗΚΗ: Ενημερώνει το Supabase για το τι παίζει τώρα στο site
+    await updateStationStatus(media.title, media.genreLabel);
 
     if (media.isAd) songsSinceAd = 0;
     else if (media.isSong) songsSinceAd++;
