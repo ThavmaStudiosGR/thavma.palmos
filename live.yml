@@ -1,4 +1,4 @@
-name: Thavma Palmos - 24/7 Live Radio (Seamless Overlap)
+name: Thavma Palmos - 24/7 Live Radio V5
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test_newyear:
-        description: 'Δοκιμή Countdown Πρωτοχρονιάς (ολοκληρώνεται σε ~55 δευτ.)'
+        description: 'One-time test Πρωτοχρονιάς (~60 sec + special sequence)'
         required: false
         type: boolean
         default: false
@@ -14,7 +14,7 @@ on:
 jobs:
   stream:
     runs-on: ubuntu-latest
-    timeout-minutes: 280
+    timeout-minutes: 245
 
     steps:
       - name: Checkout repository
@@ -28,15 +28,16 @@ jobs:
       - name: Install dependencies
         run: npm install express @supabase/supabase-js nodemailer
 
-      - name: Verify ffmpeg is available
+      - name: Verify ffmpeg / ffprobe
         run: |
           if ! command -v ffmpeg &> /dev/null; then
             sudo apt-get update -y
             sudo apt-get install -y ffmpeg
           fi
           ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
 
-      - name: Ensure fallback fonts (Liberation) are installed
+      - name: Ensure fallback fonts
         run: |
           if [ ! -f /usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf ]; then
             sudo apt-get update -y
@@ -49,16 +50,18 @@ jobs:
           if [ -d "./fonts" ]; then
             sudo cp ./fonts/*.ttf /usr/share/fonts/truetype/custom/ 2>/dev/null || true
             sudo fc-cache -f -v /usr/share/fonts/truetype/custom/
-          else
-            echo "No fonts folder found - using Liberation fallback"
           fi
 
-      - name: Run 24/7 radio stream
+      - name: Run 24/7 radio stream V5
         env:
           YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           TEST_NEWYEAR: ${{ inputs.test_newyear }}
-        run: timeout 16200 node index.js || true
+          MIX_CROSSFADE_SECONDS: '3'
+          AD_EVERY_SONGS: '7'
+          DAY_BG_START_HOUR: '7'
+          NIGHT_BG_START_HOUR: '20'
+        run: timeout 14460 node index.js || true
