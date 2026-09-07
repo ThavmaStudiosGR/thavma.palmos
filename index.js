@@ -491,7 +491,7 @@ async function checkSupabaseRequest() {
             }
             if (!claimRows?.length) continue;
             
-            const claimedRequest = claimRows;
+            const claimedRequest = claimRows[0];
             const targetSongFile = claimedRequest.song || ''; 
             const category = extractTag(targetSongFile) || claimedRequest.category || '';
             const categoryRow = categorySettings.get(category);
