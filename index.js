@@ -12,14 +12,35 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav']);
 
-const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+function isAudioFile(fileName) {
+    return AUDIO_EXTENSIONS.has(path.extname(String(fileName || '')).toLowerCase());
+}
+
+function findNamedAudio(baseName) {
+    for (const ext of ['.mp3', '.wav']) {
+        const candidate = `${baseName}${ext}`;
+        if (fs.existsSync(path.join(__dirname, candidate))) return candidate;
+    }
+    return null;
+}
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false }
+}) : null;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('[SUPABASE ERROR] Λείπουν τα SUPABASE_URL ή SUPABASE_KEY από τα GitHub Secrets!');
+    console.error('[SUPABASE ERROR] Λείπουν τα SUPABASE_URL και/ή SUPABASE_SERVICE_ROLE_KEY (ή το παλιό SUPABASE_KEY) από τα GitHub Secrets!');
 }
+
+const STREAM_OWNER_ID = process.env.STREAM_OWNER_ID || process.env.GITHUB_RUN_ID || `local-${process.pid}-${Date.now()}`;
+const STREAM_LEASE_SECONDS = 90;
+let leaseRenewTimer = null;
+let ownsStreamLease = false;
 
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -38,36 +59,21 @@ app.post('/api/request-song', async (req, res) => {
         return res.status(503).json({ error: 'Supabase not configured' });
     }
 
-    const isVip = vipCode === 'TP26';
-
     try {
-        if (!isVip) {
-            const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-            const { data: recent, error: recentErr } = await supabase
-                .from('song_requests')
-                .select('id, created_at')
-                .eq('device_id', deviceId)
-                .gte('created_at', thirtyMinAgo)
-                .limit(1);
-            if (recentErr) throw recentErr;
-            if (recent && recent.length > 0) {
-                return res.status(429).json({
-                    error: 'Μπορείς να στείλεις 1 παραγγελία κάθε 30 λεπτά. Αν έχεις κωδικό VIP, βάλτον για απεριόριστες παραγγελίες.'
-                });
-            }
-        }
-
-        const { error } = await supabase.from('song_requests').insert([{
-            song,
-            requester,
-            category: category || null,
-            email: email || null,
-            device_id: deviceId,
-            is_vip: isVip,
-            status: 'pending'
-        }]);
+        const { data, error } = await supabase.rpc('submit_song_request', {
+            p_song: song,
+            p_requester: requester,
+            p_category: category || null,
+            p_device_id: deviceId,
+            p_vip_code: vipCode || null,
+            p_email: email || null
+        });
         if (error) throw error;
-        res.json({ success: true });
+        if (!data?.ok) {
+            const status = data?.code === 'cooldown' ? 429 : 400;
+            return res.status(status).json({ error: data?.message || 'Η παραγγελία δεν έγινε δεκτή.' });
+        }
+        res.json({ success: true, isVip: !!data.is_vip });
     } catch (error) {
         console.error('[REQUEST ERROR]', error.message);
         res.status(500).json({ error: 'Σφάλμα κατά την αποθήκευση της παραγγελίας' });
@@ -82,13 +88,33 @@ async function syncSongsToSupabase() {
     if (!supabase) return;
     try {
         const files = fs.readdirSync(__dirname);
-        const mp3Files = files.filter(f => path.extname(f).toLowerCase() === '.mp3' && !isHourFile(f));
-        const { error } = await supabase.from('songs').upsert(
-            mp3Files.map(f => ({ filename: f, synced_at: new Date() })),
-            { onConflict: 'filename' }
-        );
-        if (error) throw error;
-        console.log(`[SUPABASE SYNC] Συγχρονίστηκαν ${mp3Files.length} τραγούδια`);
+        const audioFiles = files
+            .filter(f => isAudioFile(f) && !isHourFile(f))
+            .sort((a, b) => a.localeCompare(b, 'el'));
+
+        const syncedAt = new Date().toISOString();
+        if (audioFiles.length > 0) {
+            const { error: upsertError } = await supabase.from('songs').upsert(
+                audioFiles.map(f => ({ filename: f, synced_at: syncedAt })),
+                { onConflict: 'filename' }
+            );
+            if (upsertError) throw upsertError;
+        }
+
+        // Σβήνουμε από τη βάση τραγούδια που δεν υπάρχουν πλέον στο repository,
+        // ώστε το site να μη δίνει παραγγελία για ανύπαρκτο αρχείο.
+        const { data: dbSongs, error: listError } = await supabase.from('songs').select('filename');
+        if (listError) throw listError;
+
+        const localSet = new Set(audioFiles);
+        const stale = (dbSongs || []).map(r => r.filename).filter(Boolean).filter(f => !localSet.has(f));
+        if (stale.length > 0) {
+            const { error: deleteError } = await supabase.from('songs').delete().in('filename', stale);
+            if (deleteError) throw deleteError;
+            console.log(`[SUPABASE SYNC] Αφαιρέθηκαν ${stale.length} παλιά entries από το songs.`);
+        }
+
+        console.log(`[SUPABASE SYNC] Η λίστα songs είναι ακριβές mirror των ${audioFiles.length} τοπικών MP3/WAV τραγουδιών.`);
     } catch (error) {
         console.error('[SYNC ERROR]', error.message);
     }
@@ -103,30 +129,47 @@ async function checkSupabaseRequest() {
             .eq('status', 'pending')
             .order('created_at', { ascending: true })
             .limit(1);
+
         if (error || !data || data.length === 0) return null;
         const request = data[0];
-        const { error: updateErr } = await supabase.from('song_requests').update({ status: 'processed' }).eq('id', request.id);
-        if (updateErr) {
-            console.error('[REQUEST UPDATE ERROR — ΘΑ ΞΑΝΑΠΑΙΞΕΙ ΤΟ ΙΔΙΟ ΑΙΤΗΜΑ!]', updateErr.message);
-        }
+
         const files = fs.readdirSync(__dirname);
-        const match = files.find(f => f.toLowerCase().includes(request.song.toLowerCase()) && path.extname(f).toLowerCase() === '.mp3');
-        if (match) {
-            console.log(`[LIVE REQUEST] Αναπαράγεται: ${match} (από ${request.requester})`);
-            if (request.email) {
-                try {
-                    await transporter.sendMail({
-                        to: request.email,
-                        from: process.env.EMAIL_USER,
-                        subject: 'Το τραγούδι σας αναμεταδόθηκε! 🎵',
-                        html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${request.song}" αναμεταδίδεται τώρα στο Thavma Παλμός! 🎧</p>`
-                    });
-                } catch (mailErr) {
-                    console.error('[EMAIL ERROR]', mailErr.message);
-                }
-            }
-            return { filename: match, requester: request.requester };
+        const match = files.find(f =>
+            isAudioFile(f) &&
+            f.toLowerCase() === String(request.song || '').toLowerCase()
+        );
+
+        if (!match) {
+            await supabase.from('song_requests')
+                .update({ status: 'rejected' })
+                .eq('id', request.id);
+            console.error(`[REQUEST] Το ζητούμενο αρχείο δεν υπάρχει πλέον: ${request.song}`);
+            return null;
         }
+
+        const { error: updateErr } = await supabase.from('song_requests')
+            .update({ status: 'playing' })
+            .eq('id', request.id)
+            .eq('status', 'pending');
+
+        if (updateErr) throw updateErr;
+
+        console.log(`[LIVE REQUEST] Αναπαράγεται: ${match} (από ${request.requester})`);
+
+        if (request.email && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+            try {
+                await transporter.sendMail({
+                    to: request.email,
+                    from: process.env.EMAIL_USER,
+                    subject: 'Το τραγούδι σας αναμεταδίδεται! 🎵',
+                    html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${request.song}" αναμεταδίδεται τώρα στο Thavma Παλμός! 🎧</p>`
+                });
+            } catch (mailErr) {
+                console.error('[EMAIL ERROR]', mailErr.message);
+            }
+        }
+
+        return { filename: match, requester: request.requester, requestId: request.id };
     } catch (error) {
         console.error('[REQUEST CHECK ERROR]', error.message);
     }
@@ -148,15 +191,18 @@ function getGreekTime() {
 }
 
 function findHourFile(hour) {
-    const hourFileName = `clock${hour}.mp3`;
-    return fs.existsSync(path.join(__dirname, hourFileName)) ? hourFileName : null;
+    return findNamedAudio(`clock${hour}`);
 }
 
 function isHourFile(fileName) {
-    if (fileName === 'thavma_palmos_jingle.mp3' || fileName === 'ethnikos_ymnos.mp3') return true;
-    if (fileName === 'ΚαλήΧρονιά.mp3' || fileName === 'thavma_palmos_christmas_jingle.mp3') return true;
-    if (fileName === 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3') return true;
-    return /^clock\d+\.mp3$/.test(fileName);
+    const ext = path.extname(String(fileName || '')).toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) return false;
+
+    const base = path.basename(fileName, ext);
+    if (base === 'thavma_palmos_jingle' || base === 'ethnikos_ymnos') return true;
+    if (base === 'ΚαλήΧρονιά' || base === 'thavma_palmos_christmas_jingle') return true;
+    if (base === 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19') return true;
+    return /^clock\d+$/.test(base);
 }
 
 function isChristmasPeriod(month, date) {
@@ -225,12 +271,23 @@ let lastAnthemDate = getGreekTime().date;
 let songCounter = 0;
 let currentNowPlaying = { title: "Φορτώνει...", genre: "Radio" };
 
-let globalPlayedSongs = [];
 let newYearQueue = [];
 let lastNewYearSequenceKey = null;
 
 let currentFfmpegProcess = null;
 let isShuttingDown = false;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cleanDisplayTitle(filename) {
+    return String(filename || '')
+        .replace(/^\([^)]+\)\s*/, '')
+        .replace(/\.(mp3|wav)$/i, '')
+        .replace(/_/g, ' ')
+        .trim();
+}
 
 function hasTag(filename, ...variants) {
     return variants.some(v => filename.startsWith(`(${v})`));
@@ -251,6 +308,133 @@ const TAG = {
     LAIKA_ZEIMBEKIKA: ['ΛΖ'],
     CHRISTMAS: ['X']
 };
+
+
+async function acquireStreamLease() {
+    if (!supabase) return true;
+    const { data, error } = await supabase.rpc('acquire_stream_lease', {
+        p_owner_id: STREAM_OWNER_ID,
+        p_lease_seconds: STREAM_LEASE_SECONDS
+    });
+    if (error) {
+        console.error('[LEASE ERROR] Δεν μπόρεσα να αποκτήσω stream lease:', error.message);
+        return false;
+    }
+    ownsStreamLease = data === true;
+    return ownsStreamLease;
+}
+
+async function renewStreamLease() {
+    if (!supabase || !ownsStreamLease || isShuttingDown) return;
+    const { data, error } = await supabase.rpc('renew_stream_lease', {
+        p_owner_id: STREAM_OWNER_ID,
+        p_lease_seconds: STREAM_LEASE_SECONDS
+    });
+    if (error || data !== true) {
+        console.error('[LEASE LOST] Χάθηκε το stream lease. Σταματά ο encoder για να μην υπάρχουν δύο jobs μαζί.');
+        ownsStreamLease = false;
+        if (currentFfmpegProcess) currentFfmpegProcess.kill('SIGTERM');
+        if (leaseRenewTimer) clearInterval(leaseRenewTimer);
+        leaseRenewTimer = null;
+        setTimeout(() => { if (!isShuttingDown) waitForLeaseAndStart(); }, 5000);
+    }
+}
+
+async function releaseStreamLease() {
+    if (!supabase || !ownsStreamLease) return;
+    try {
+        await supabase.rpc('release_stream_lease', { p_owner_id: STREAM_OWNER_ID });
+    } catch (_) {}
+    ownsStreamLease = false;
+}
+
+async function claimStationEvent(eventKey) {
+    if (!supabase) {
+        if (lastNewYearSequenceKey === eventKey) return false;
+        lastNewYearSequenceKey = eventKey;
+        return true;
+    }
+
+    const { data, error } = await supabase.rpc('claim_station_event', { p_event_key: eventKey });
+    if (error) {
+        console.error('[EVENT CLAIM ERROR]', error.message);
+        return false;
+    }
+    return data === true;
+}
+
+async function getRecentPlayedFilenames(limit = 5) {
+    if (!supabase) return [];
+    try {
+        const { data, error } = await supabase
+            .from('play_history')
+            .select('filename')
+            .order('played_at', { ascending: false })
+            .limit(limit);
+        if (error) throw error;
+        return [...new Set((data || []).map(r => r.filename).filter(Boolean))];
+    } catch (error) {
+        console.error('[HISTORY RECENT ERROR]', error.message);
+        return [];
+    }
+}
+
+async function claimRotationSong(rotationKey, candidates) {
+    const uniqueCandidates = [...new Set((candidates || []).filter(Boolean))];
+    if (uniqueCandidates.length === 0) return null;
+
+    if (supabase) {
+        const recent = await getRecentPlayedFilenames(5);
+        const { data, error } = await supabase.rpc('claim_rotation_song', {
+            p_rotation_key: rotationKey,
+            p_candidates: uniqueCandidates,
+            p_recent: recent
+        });
+        if (!error && data) return data;
+        if (error) console.error(`[ROTATION RPC ERROR ${rotationKey}]`, error.message);
+    }
+
+    // Fallback μόνο για να μη σταματήσει ο σταθμός αν λείπει προσωρινά το RPC.
+    const fallback = shuffleArray([...uniqueCandidates]);
+    return fallback[0] || null;
+}
+
+async function prepareNewYearSequence(time) {
+    // Επιτρέπουμε recovery για τα πρώτα 15 λεπτά της 1ης Ιανουαρίου.
+    if (!(time.month === 0 && time.date === 1 && time.hour === 0 && time.minute < 15)) return;
+    if (newYearQueue.length > 0) return;
+
+    const eventKey = `newyear-${time.year}`;
+    if (lastNewYearSequenceKey === eventKey) return;
+
+    const claimed = await claimStationEvent(eventKey);
+    lastNewYearSequenceKey = eventKey;
+    if (!claimed) return;
+
+    const seq = [];
+    const clock0 = findHourFile(0);
+    if (clock0) {
+        seq.push({ file: clock0, title: 'Η ώρα είναι 00.00', genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true });
+    }
+
+    const specialBaseNames = [
+        'ΚαλήΧρονιά',
+        'thavma_palmos_christmas_jingle',
+        'Αρχιμηνιά και Αρχιχρονιά το λάδι 19'
+    ];
+    for (const baseName of specialBaseNames) {
+        const file = findNamedAudio(baseName);
+        if (file) {
+            seq.push({ file, title: cleanDisplayTitle(file), genreLabel: 'Πρωτοχρονιάτικη Ακολουθία', isSystem: true });
+        }
+    }
+
+    newYearQueue = seq;
+    lastAnnouncedHour = 0;
+    lastAnthemDate = time.date; // Δεν αφήνουμε τον ύμνο να καθυστερήσει την Πρωτοχρονιάτικη ακολουθία.
+    songCounter = 0;
+    console.log(`[NEW YEAR] Κλειδώθηκε και προγραμματίστηκε η ακολουθία ${eventKey} (${newYearQueue.length} αρχεία).`);
+}
 
 function firstExisting(paths) {
     for (const p of paths) {
@@ -296,10 +480,17 @@ function isNewYearXBoostWindow(month, date, hour) {
 async function selectNextFile() {
     const time = getGreekTime();
 
+    // Πρωτοχρονιά: ανεξάρτητη από το αν το process ξεκίνησε πριν ή μετά τις 00:00.
+    await prepareNewYearSequence(time);
+    if (newYearQueue.length > 0) {
+        return newYearQueue.shift();
+    }
+
     if (time.hour === 0 && lastAnthemDate !== time.date) {
-        if (fs.existsSync(path.join(__dirname, 'ethnikos_ymnos.mp3'))) {
+        const anthemFile = findNamedAudio('ethnikos_ymnos');
+        if (anthemFile) {
             lastAnthemDate = time.date;
-            return { file: 'ethnikos_ymnos.mp3', title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
+            return { file: anthemFile, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
         }
     }
 
@@ -308,155 +499,165 @@ async function selectNextFile() {
         if (hourFile) {
             console.log(`[TIME CHIME] Βρέθηκε το αρχείο ώρας: ${hourFile}`);
             lastAnnouncedHour = time.hour;
-            let hourString = time.hour < 10 ? `0${time.hour}.00` : `${time.hour}.00`;
-
-            if (time.hour === 0 && time.month === 0 && time.date === 1) {
-                const sequenceKey = `${time.year}-${time.date}`;
-                if (lastNewYearSequenceKey !== sequenceKey) {
-                    const nySequenceFiles = ['ΚαλήΧρονιά.mp3', 'thavma_palmos_christmas_jingle.mp3', 'Αρχιμηνιά και Αρχιχρονιά το λάδι 19.mp3'];
-                    newYearQueue = nySequenceFiles.filter(f => fs.existsSync(path.join(__dirname, f)));
-                    lastNewYearSequenceKey = sequenceKey;
-                    console.log(`[NEW YEAR] Προγραμματίστηκε η Πρωτοχρονιάτικη ακολουθία.`);
-                }
-            }
+            const hourString = time.hour < 10 ? `0${time.hour}.00` : `${time.hour}.00`;
             return { file: hourFile, title: `Η ώρα είναι ${hourString}`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true };
         }
     }
 
-    if (newYearQueue.length > 0) {
-        const nextFile = newYearQueue.shift();
-        if (fs.existsSync(path.join(__dirname, nextFile))) {
-            let displayTitle = nextFile.replace('.mp3', '');
-            return { file: nextFile, title: displayTitle, genreLabel: 'Πρωτοχρονιάτικη Ακολουθία', isSystem: true };
-        }
-    }
-
     if (songCounter >= 5) {
-        if (fs.existsSync(path.join(__dirname, 'thavma_palmos_jingle.mp3'))) {
+        const jingleFile = findNamedAudio('thavma_palmos_jingle');
+        if (jingleFile) {
             songCounter = 0;
-            return { file: 'thavma_palmos_jingle.mp3', title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
+            return { file: jingleFile, title: 'Thavma Παλμός Jingle', genreLabel: 'Σήμα Σταθμού', isSystem: true };
         }
     }
 
     const liveRequest = await checkSupabaseRequest();
     if (liveRequest) {
-        let displayTitle = liveRequest.filename.replace(/^[A-ZZΠα-ωήίόύέώ\s]+\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
         return {
             file: liveRequest.filename,
-            title: displayTitle,
-            genreLabel: `Παραγγελιά Ακροατή [${liveRequest.requester}]`,
+            title: cleanDisplayTitle(liveRequest.filename),
+            genreLabel: `Παραγγελία Ακροατή [${liveRequest.requester}]`,
             isSong: true,
-            isRequest: true
+            isRequest: true,
+            requestId: liveRequest.requestId
         };
     }
 
     const files = fs.readdirSync(__dirname);
-    let mp3Files = files.filter(file => path.extname(file).toLowerCase() === '.mp3' && !isHourFile(file));
-    if (mp3Files.length === 0) return null;
+    const audioFiles = files.filter(file => isAudioFile(file) && !isHourFile(file));
+    if (audioFiles.length === 0) return null;
 
     const christmasActive = isChristmasPeriod(time.month, time.date);
-    const xFiles = mp3Files.filter(f => hasTag(f, ...TAG.CHRISTMAS));
-    const normalPool = mp3Files.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
+    const xFiles = audioFiles.filter(f => hasTag(f, ...TAG.CHRISTMAS));
+    const normalPool = audioFiles.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
 
     const genre = getRequiredGenre();
     let filteredFiles = [];
-    let genreLabel = "Mix Πρόγραμμα";
+    let genreLabel = 'Mix Πρόγραμμα';
+    let rotationKey = 'MIX';
 
     if (genre === 'B') {
         filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.BEATS));
-        genreLabel = "Beats (Disco, Dance, Club)";
+        genreLabel = 'Beats (Disco, Dance, Club)';
+        rotationKey = 'B';
     } else if (genre === 'R') {
         filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.RADIO));
-        genreLabel = "Radio (Κανονική Ροή)";
+        genreLabel = 'Radio (Κανονική Ροή)';
+        rotationKey = 'R';
     } else if (genre === 'P_LZ') {
         filteredFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
-        genreLabel = "Παραδοσιακά & Λαϊκά";
+        genreLabel = 'Παραδοσιακά & Λαϊκά';
+        rotationKey = 'P_LZ';
     } else if (genre === 'EASTER_MODE') {
         const easterFiles = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         if (easterFiles.length > 0 && Math.random() < 0.20) {
             filteredFiles = easterFiles;
-            genreLabel = "Πασχαλινό Πρόγραμμα (Έμφαση στα Παραδοσιακά)";
+            genreLabel = 'Πασχαλινό Πρόγραμμα (Έμφαση στα Παραδοσιακά)';
+            rotationKey = 'P_LZ';
         } else {
             filteredFiles = normalPool;
-            genreLabel = "Πασχαλινό Πρόγραμμα (Mix)";
+            genreLabel = 'Πασχαλινό Πρόγραμμα (Mix)';
+            rotationKey = 'MIX';
         }
     } else {
         filteredFiles = normalPool;
-        genreLabel = "Mix Πρόγραμμα";
+        genreLabel = 'Mix Πρόγραμμα';
+        rotationKey = 'MIX';
     }
 
-    if (filteredFiles.length === 0) filteredFiles = normalPool.length > 0 ? normalPool : mp3Files;
+    if (filteredFiles.length === 0) {
+        filteredFiles = normalPool.length > 0 ? normalPool : audioFiles;
+        rotationKey = 'MIX';
+        genreLabel = 'Mix Πρόγραμμα';
+    }
 
+    // Τα Χριστουγεννιάτικα είναι δική τους κατηγορία/rotation.
+    // Δεν τα συγχωνεύουμε στο MIX, γιατί αυτό χαλούσε τον κανόνα "μία φορά μέχρι να τελειώσει η κατηγορία".
     if (christmasActive && xFiles.length > 0) {
         const xBoost = isNewYearXBoostWindow(time.month, time.date, time.hour);
         const xProbability = xBoost ? 0.80 : 0.35;
         if (Math.random() < xProbability) {
             filteredFiles = xFiles;
-            genreLabel = xBoost ? "Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά" : "Χριστουγεννιάτικο Πρόγραμμα (X)";
-        } else {
-            filteredFiles = filteredFiles.concat(xFiles);
+            rotationKey = 'X';
+            genreLabel = xBoost
+                ? 'Χριστουγεννιάτικο Πρόγραμμα (X) - Πρωτοχρονιά'
+                : 'Χριστουγεννιάτικο Πρόγραμμα (X)';
         }
     }
 
-    if (filteredFiles.length === 0) filteredFiles = mp3Files;
+    const randomFile = await claimRotationSong(rotationKey, filteredFiles);
+    if (!randomFile) return null;
 
-    let availableFiles = filteredFiles.filter(f => !globalPlayedSongs.includes(f));
-    if (availableFiles.length === 0) {
-        globalPlayedSongs = globalPlayedSongs.filter(f => !filteredFiles.includes(f));
-        availableFiles = filteredFiles;
-    }
-
-    const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
-    const now = Date.now();
-    let randomFile;
-    let availableNewFiles = availableFiles.filter(f => {
-        const filePath = path.join(__dirname, f);
-        return fs.existsSync(filePath) && (now - fs.statSync(filePath).mtimeMs) <= THREE_DAYS_MS;
-    });
-
-    if (availableNewFiles.length > 0) {
-        availableNewFiles.sort((a, b) => {
-            return fs.statSync(path.join(__dirname, b)).mtimeMs - fs.statSync(path.join(__dirname, a)).mtimeMs;
-        });
-        randomFile = availableNewFiles[0];
-        genreLabel = "ΝΕΟ ΤΡΑΓΟΥΔΙ! - " + genreLabel;
-    } else {
-        shuffleArray(availableFiles);
-        randomFile = availableFiles[0];
-    }
-
-    globalPlayedSongs.push(randomFile);
-    logPlayHistory(randomFile);
-    let displayTitle = randomFile.replace(/^[A-ZZΠα-ωήίόύέώ\s]+\s*/i, '').replace('.mp3', '').replace(/_/g, ' ');
-    return { file: randomFile, title: displayTitle, genreLabel: genreLabel, isSong: true };
+    await logPlayHistory(randomFile, rotationKey, 'auto');
+    return {
+        file: randomFile,
+        title: cleanDisplayTitle(randomFile),
+        genreLabel,
+        isSong: true,
+        rotationKey
+    };
 }
 
 function buildNewYearCountdownFilters(spawnTime) {
     if (process.env.TEST_NEWYEAR === 'true') {
         return buildCountdownFromOffsets({
-            off2350: 5, off2359: 25, off235950: 35, offMidnight: 45, nyEnd: 55,
+            off2350: 5,
+            off2359: 25,
+            off235950: 35,
+            offMidnight: 45,
+            nyEnd: 60,
             nextYear: spawnTime.year + 1
         });
     }
 
-    const isDec31 = (spawnTime.month === 11 && spawnTime.date === 31);
-    const isEarlyJan1 = (spawnTime.month === 0 && spawnTime.date === 1 && spawnTime.hour === 0 && spawnTime.minute === 0 && spawnTime.second < 20);
+    const isDec31Window = (
+        spawnTime.month === 11 &&
+        spawnTime.date === 31 &&
+        (spawnTime.hour > 23 || (spawnTime.hour === 23 && spawnTime.minute >= 45))
+    );
+    const isEarlyJan1 = (
+        spawnTime.month === 0 &&
+        spawnTime.date === 1 &&
+        spawnTime.hour === 0 &&
+        spawnTime.minute === 0 &&
+        spawnTime.second < 20
+    );
 
-    if (!isDec31 && !isEarlyJan1) {
-        return { filters: [], blackoutStart: null, blackoutEnd: null, suppressNormalOverlayUntil: null };
+    if (!isDec31Window && !isEarlyJan1) {
+        return {
+            filters: [],
+            blackoutStart: null,
+            blackoutEnd: null,
+            suppressNormalOverlayFrom: null,
+            suppressNormalOverlayUntil: null
+        };
+    }
+
+    if (isEarlyJan1) {
+        const midnight = athensTargetDate(spawnTime, 0, 0, 0, 0);
+        const offMidnight = secondsFromNowTo(spawnTime, midnight);
+        return buildCountdownFromOffsets({
+            off2350: -999,
+            off2359: -999,
+            off235950: -999,
+            offMidnight,
+            nyEnd: offMidnight + 15,
+            nextYear: spawnTime.year
+        });
     }
 
     const target2350 = athensTargetDate(spawnTime, 0, 23, 50, 0);
     const target2359 = athensTargetDate(spawnTime, 0, 23, 59, 0);
     const target235950 = athensTargetDate(spawnTime, 0, 23, 59, 50);
-    const targetMidnight = isDec31 ? athensTargetDate(spawnTime, 1, 0, 0, 0) : athensTargetDate(spawnTime, 0, 0, 0, 0);
+    const targetMidnight = athensTargetDate(spawnTime, 1, 0, 0, 0);
 
     const off2350 = secondsFromNowTo(spawnTime, target2350);
     const off2359 = secondsFromNowTo(spawnTime, target2359);
     const off235950 = secondsFromNowTo(spawnTime, target235950);
     const offMidnight = secondsFromNowTo(spawnTime, targetMidnight);
-    const nextYear = isDec31 ? spawnTime.year + 1 : spawnTime.year;
-    const nyEnd = offMidnight + 10;
+    const nextYear = spawnTime.year + 1;
+    const nyEnd = offMidnight + 15;
 
     return buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, nyEnd, nextYear });
 }
@@ -465,47 +666,50 @@ function buildCountdownFromOffsets({ off2350, off2359, off235950, offMidnight, n
     const filters = [];
     const remainingExpr = `(${offMidnight.toFixed(2)}-t)`;
 
-    const goldSteps = ['white', '0xFFF5CC', '0xFFEDB0', '0xFFE494', '0xFFDC78', '0xFFD35C', '0xFFCB40', '0xFFD700', '0xFFD700'];
-    for (let i = 0; i < 9; i++) {
-        const start = off2350 + i * 60;
-        const end = off2350 + (i + 1) * 60;
-        if (end <= 0) continue;
-        const fontsize = 42 + i * 7;
-        const color = goldSteps[i];
-        const countdownText = `%{eif\\:trunc(${remainingExpr}/60)\\:d\\:2}\\:%{eif\\:mod(trunc(${remainingExpr})\\,60)\\:d\\:2}`;
-        filters.push(`drawtext=${FONT_ARG}text='${countdownText}':x=(w-text_w)/2:y=90:fontsize=${fontsize}:fontcolor=${color}:box=1:boxcolor=black@0.55:boxborderw=12:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
+    // 23:50 - 23:59: MM:SS. Ένα δυναμικό drawtext αντί για δεκάδες filters.
+    if (off2359 > 0) {
+        const mmssText = `%{eif\:trunc(${remainingExpr}/60)\:d\:2}\:%{eif\:mod(trunc(${remainingExpr})\,60)\:d\:2}`;
+        filters.push(
+            `drawtext=${FONT_ARG}text='${mmssText}':x=(w-text_w)/2:y=90:fontsize=68:` +
+            `fontcolor=0xFFD700:box=1:boxcolor=black@0.58:boxborderw=14:` +
+            `enable='between(t\,${Math.max(0, off2350).toFixed(2)}\,${off2359.toFixed(2)})'`
+        );
     }
 
-    for (let i = 0; i < 50; i++) {
-        const start = off2359 + i;
-        const end = off2359 + i + 1;
-        if (end <= 0) continue;
-        const fontsize = i % 2 === 0 ? 130 : 150;
-        const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:2}`;
-        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=0xFFD700:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
+    // 23:59:00 - 23:59:50: 60...11 δευτερόλεπτα.
+    if (off235950 > 0) {
+        const secondsText = `%{eif\:ceil(${remainingExpr})\:d\:2}`;
+        filters.push(
+            `drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:` +
+            `fontsize=145:fontcolor=0xFFD700:box=1:boxcolor=black@0.45:boxborderw=18:` +
+            `enable='between(t\,${Math.max(0, off2359).toFixed(2)}\,${off235950.toFixed(2)})'`
+        );
     }
 
-    const crazyColors = ['0xFFD700', '0xFFFFFF'];
-    for (let i = 0; i < 10; i++) {
-        const start = off235950 + i;
-        const end = off235950 + i + 1;
-        if (end <= 0) continue;
-        const fontsize = i % 2 === 0 ? 190 : 220;
-        const color = crazyColors[i % 2];
-        const secondsText = `%{eif\\:trunc(${remainingExpr})\\:d\\:1}`;
-        filters.push(`drawtext=${FONT_ARG}text='${secondsText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${fontsize}:fontcolor=${color}:enable='between(t\\,${Math.max(0, start).toFixed(2)}\\,${end.toFixed(2)})'`);
+    // Τελευταία 10 δευτερόλεπτα: full-screen μαύρο και πολύ μεγάλος αριθμός.
+    if (offMidnight > 0) {
+        const lastSecondsText = `%{eif\:ceil(${remainingExpr})\:d}`;
+        filters.push(
+            `drawtext=${FONT_ARG}text='${lastSecondsText}':x=(w-text_w)/2:y=(h-text_h)/2:` +
+            `fontsize=220:fontcolor=0xFFD700:` +
+            `enable='between(t\,${Math.max(0, off235950).toFixed(2)}\,${offMidnight.toFixed(2)})'`
+        );
     }
 
     const nyText = `Καλή Χρονιά ${nextYear}!`.replace(/'/g, '');
     if (nyEnd > 0) {
-        filters.push(`drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.5:boxborderw=16:enable='between(t\\,${Math.max(0, offMidnight).toFixed(2)}\\,${nyEnd.toFixed(2)})'`);
+        filters.push(
+            `drawtext=${FONT_ARG}text='${nyText}':x=(w-text_w)/2:y=(h-text_h)/2:` +
+            `fontsize=100:fontcolor=0xFFD700:box=1:boxcolor=black@0.55:boxborderw=18:` +
+            `enable='between(t\,${Math.max(0, offMidnight).toFixed(2)}\,${nyEnd.toFixed(2)})'`
+        );
     }
 
     return {
         filters,
-        blackoutStart: off2359,
-        blackoutEnd: offMidnight,
-        suppressNormalOverlayFrom: off2359,
+        blackoutStart: off235950,
+        blackoutEnd: nyEnd,
+        suppressNormalOverlayFrom: off235950,
         suppressNormalOverlayUntil: nyEnd
     };
 }
@@ -521,7 +725,17 @@ function secondsFromNowTo(spawnTime, targetDate) {
     return (targetDate - spawnTime.raw) / 1000;
 }
 
+function secondsUntilNewYearMidnight(spawnTime) {
+    if (!(spawnTime.month === 11 && spawnTime.date === 31 && spawnTime.hour === 23 && spawnTime.minute >= 50)) {
+        return null;
+    }
+    const targetMidnight = athensTargetDate(spawnTime, 1, 0, 0, 0);
+    return Math.max(0, secondsFromNowTo(spawnTime, targetMidnight));
+}
+
 async function startNextMedia() {
+    if (isShuttingDown || (supabase && !ownsStreamLease)) return;
+
     const media = await selectNextFile();
 
     if (!media || !fs.existsSync(path.join(__dirname, 'background.jpg'))) {
@@ -541,7 +755,9 @@ async function startNextMedia() {
             id: 1,
             title: media.title,
             genre: media.genreLabel,
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
+            heartbeat_at: new Date().toISOString(),
+            stream_owner: STREAM_OWNER_ID
         }).then(({ error }) => {
             if (error) console.error('[STATUS SYNC ERROR]', error.message);
         });
@@ -549,25 +765,26 @@ async function startNextMedia() {
 
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
     if (!streamKey) {
+        console.error('[YOUTUBE ERROR] Λείπει το YOUTUBE_STREAM_KEY.');
         setTimeout(startNextMedia, 5000);
         return;
     }
 
-    const cleanLabel = media.genreLabel.replace(/'/g, "’").replace(/:/g, " — ").replace(/,/g, " ");
-    const cleanTitle = media.title.replace(/'/g, "’").replace(/:/g, ".").replace(/,/g, " ");
-    const clockText = "%{localtime\\:%H\\\\\\:%M\\\\\\:%S & %d\\\\\\/%m\\\\\\/%Y}";
+    const cleanLabel = media.genreLabel.replace(/'/g, '’').replace(/:/g, ' — ').replace(/,/g, ' ');
+    const cleanTitle = media.title.replace(/'/g, '’').replace(/:/g, '.').replace(/,/g, ' ');
+    const clockText = "%{localtime\:%H\\\:%M\\\:%S & %d\\\/%m\\\/%Y}";
 
     const spawnTime = getGreekTime();
     const ny = buildNewYearCountdownFilters(spawnTime);
 
     let blackoutFilter = '';
-    if (ny.blackoutStart !== null && ny.blackoutEnd > 0) {
-        blackoutFilter = `,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t\\,${Math.max(0, ny.blackoutStart).toFixed(2)}\\,${ny.blackoutEnd.toFixed(2)})'`;
+    if (ny.blackoutStart !== null && ny.blackoutEnd !== null && ny.blackoutEnd > 0) {
+        blackoutFilter = `,drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='between(t\,${Math.max(0, ny.blackoutStart).toFixed(2)}\,${ny.blackoutEnd.toFixed(2)})'`;
     }
 
     let normalOverlayEnable = '';
-    if (ny && ny.suppressNormalOverlayFrom !== undefined && ny.suppressNormalOverlayFrom !== null && ny.suppressNormalOverlayUntil > 0) {
-        normalOverlayEnable = `:enable='not(between(t\\,${Math.max(0, ny.suppressNormalOverlayFrom).toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
+    if (ny.suppressNormalOverlayFrom !== null && ny.suppressNormalOverlayUntil !== null && ny.suppressNormalOverlayUntil > 0) {
+        normalOverlayEnable = `:enable='not(between(t\,${Math.max(0, ny.suppressNormalOverlayFrom).toFixed(2)}\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
     const baseOverlayFilters =
@@ -575,10 +792,11 @@ async function startNextMedia() {
         `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=50:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=7${normalOverlayEnable},` +
         `drawtext=fontfile='${TIME_FONT}':text='${clockText}':x=w-tw-20:y=22:fontsize=18:fontcolor=black${normalOverlayEnable}`;
 
-    const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(', ') : '';
-    const vfChain = `scale=854:480${blackoutFilter}, ${baseOverlayFilters}${countdownFilterChain}`;
+    const countdownFilterChain = ny.filters.length > 0 ? ',' + ny.filters.join(',') : '';
+    const vfChain = `scale=854:480${blackoutFilter},${baseOverlayFilters}${countdownFilterChain}`;
 
-    const ffmpeg = spawn('ffmpeg', [
+    const ffmpegArgs = [
+        '-hide_banner', '-loglevel', 'warning',
         '-re', '-fflags', '+genpts', '-loop', '1', '-framerate', '12', '-i', 'background.jpg',
         '-i', media.file,
         '-map', '0:v:0', '-map', '1:a:0',
@@ -588,62 +806,135 @@ async function startNextMedia() {
         '-c:a', 'aac', '-b:a', '192k',
         '-af', 'aresample=async=1:min_hard_comp=0.100000:first_pts=0',
         '-max_muxing_queue_size', '4096',
-        '-shortest', '-pix_fmt', 'yuv420p', '-f', 'flv',
-        `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
-    ], { stdio: 'ignore' });
+        '-shortest'
+    ];
 
+    // Από 23:50 στις 31/12, αν κάποιο τραγούδι περνά τα μεσάνυχτα,
+    // το output κόβεται ΑΚΡΙΒΩΣ στα 00:00 ώστε να ξεκινήσει αμέσως η ειδική ακολουθία.
+    const cutAtMidnight = secondsUntilNewYearMidnight(spawnTime);
+    if (cutAtMidnight !== null && cutAtMidnight > 0.25) {
+        ffmpegArgs.push('-t', cutAtMidnight.toFixed(3));
+    }
+
+    ffmpegArgs.push(
+        '-pix_fmt', 'yuv420p', '-f', 'flv',
+        `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
+    );
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
     currentFfmpegProcess = ffmpeg;
 
-    ffmpeg.on('close', () => {
-        currentFfmpegProcess = null;
-        if (!isShuttingDown) startNextMedia();
+    let stderrTail = '';
+    ffmpeg.stderr?.on('data', chunk => {
+        stderrTail = (stderrTail + chunk.toString()).slice(-5000);
     });
-    ffmpeg.on('error', () => {
+
+    ffmpeg.on('close', async (code, signal) => {
         currentFfmpegProcess = null;
-        if (!isShuttingDown) startNextMedia();
+
+        if (media.requestId && supabase) {
+            const status = code === 0 ? 'played' : 'pending';
+            await supabase.from('song_requests').update({ status }).eq('id', media.requestId);
+        }
+
+        if (code && code !== 0 && !isShuttingDown) {
+            console.error(`[FFMPEG CLOSE] code=${code} signal=${signal || '-'}
+${stderrTail}`);
+        }
+
+        if (!isShuttingDown && (!supabase || ownsStreamLease)) {
+            setTimeout(startNextMedia, code === 0 ? 250 : 2000);
+        }
+    });
+
+    ffmpeg.on('error', async (error) => {
+        currentFfmpegProcess = null;
+        console.error('[FFMPEG SPAWN ERROR]', error.message);
+        if (media.requestId && supabase) {
+            await supabase.from('song_requests').update({ status: 'pending' }).eq('id', media.requestId);
+        }
+        if (!isShuttingDown && (!supabase || ownsStreamLease)) {
+            setTimeout(startNextMedia, 3000);
+        }
     });
 }
 
-function gracefulShutdown(signal) {
+async function gracefulShutdown(signal) {
     if (isShuttingDown) return;
     isShuttingDown = true;
-    console.log(`[SHUTDOWN] Λήψη σήματος ${signal} — ήρεμος τερματισμός για seamless handover.`);
+    console.log(`[SHUTDOWN] Λήψη σήματος ${signal} — τερματισμός encoder και παράδοση lease.`);
+
+    if (leaseRenewTimer) {
+        clearInterval(leaseRenewTimer);
+        leaseRenewTimer = null;
+    }
+
     if (currentFfmpegProcess) {
         currentFfmpegProcess.kill('SIGTERM');
     }
-    setTimeout(() => process.exit(0), 2000);
+
+    await releaseStreamLease();
+    setTimeout(() => process.exit(0), 1200);
 }
 
-async function loadRecentPlayHistory() {
+async function logPlayHistory(filename, rotationKey = null, source = 'auto') {
     if (!supabase) return;
     try {
-        const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-        const { data, error } = await supabase
-            .from('play_history')
-            .select('filename')
-            .gte('played_at', threeHoursAgo);
+        const { error } = await supabase.from('play_history').insert([{
+            filename,
+            rotation_key: rotationKey,
+            source,
+            played_at: new Date().toISOString()
+        }]);
         if (error) throw error;
-        if (data && data.length > 0) {
-            globalPlayedSongs = [...new Set(data.map(r => r.filename))];
-            console.log(`[HISTORY] Φορτώθηκαν ${globalPlayedSongs.length} πρόσφατα τραγούδια από άλλο job.`);
-        }
     } catch (error) {
-        console.error('[HISTORY LOAD ERROR]', error.message);
+        console.error('[HISTORY LOG ERROR]', error.message);
     }
 }
 
-function logPlayHistory(filename) {
-    if (!supabase) return;
-    supabase.from('play_history').insert([{ filename, played_at: new Date().toISOString() }])
-        .then(({ error }) => { if (error) console.error('[HISTORY LOG ERROR]', error.message); });
+async function startHeartbeat() {
+    if (!supabase || !ownsStreamLease || isShuttingDown) return;
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('station_status').upsert({
+        id: 1,
+        heartbeat_at: now,
+        stream_owner: STREAM_OWNER_ID,
+        updated_at: now
+    });
+    if (error) console.error('[HEARTBEAT ERROR]', error.message);
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+async function waitForLeaseAndStart() {
+    if (!supabase) {
+        console.warn('[LEASE] Supabase δεν είναι διαθέσιμο. Εκκίνηση χωρίς distributed lock.');
+        startNextMedia();
+        return;
+    }
+
+    while (!isShuttingDown) {
+        const acquired = await acquireStreamLease();
+        if (acquired) {
+            console.log(`[LEASE] Το job ${STREAM_OWNER_ID} έγινε ο ενεργός broadcaster.`);
+            await startHeartbeat();
+            leaseRenewTimer = setInterval(async () => {
+                await renewStreamLease();
+                if (ownsStreamLease) await startHeartbeat();
+            }, 30000);
+            startNextMedia();
+            return;
+        }
+
+        console.log('[LEASE] Υπάρχει ήδη ενεργό job. Το νέο job περιμένει για καθαρό handover...');
+        await sleep(10000);
+    }
+}
+
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Ο Server ξεκίνησε στο port ${PORT}`);
+    console.log(`[STREAM OWNER] ${STREAM_OWNER_ID}`);
     await syncSongsToSupabase();
-    await loadRecentPlayHistory();
-    startNextMedia();
+    await waitForLeaseAndStart();
 });
