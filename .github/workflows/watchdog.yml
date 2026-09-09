@@ -1,0 +1,35 @@
+name: Thavma Palmos - 24/7 Watchdog V6
+
+on:
+  schedule:
+    - cron: '3,18,33,48 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restart broadcaster only when none exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          active=$(gh api "repos/$REPO/actions/workflows/live.yml/runs?status=in_progress&per_page=50" --jq '.total_count')
+          queued=$(gh api "repos/$REPO/actions/workflows/live.yml/runs?status=queued&per_page=50" --jq '.total_count')
+          waiting=$(gh api "repos/$REPO/actions/workflows/live.yml/runs?status=waiting&per_page=50" --jq '.total_count' 2>/dev/null || echo 0)
+          echo "live.yml active=$active queued=$queued waiting=$waiting"
+          if [ $((active + queued + waiting)) -eq 0 ]; then
+            echo "Broadcaster is down. Dispatching a recovery run."
+            gh workflow run live.yml --repo "$REPO" --ref "$REF" \
+              -f test_newyear=false \
+              -f handover_from=watchdog \
+              -f handover_reason=watchdog_recovery
+          else
+            echo "Broadcaster or successor exists. Healthy enough; no duplicate run created."
+          fi
