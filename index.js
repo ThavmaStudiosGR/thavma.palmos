@@ -1254,8 +1254,8 @@ async function startNextMedia() {
     // V6: clock/date returns to the original visual language: transparent burgundy,
     // upper-left. Track/category move to the lower-left so they never collide.
     const baseOverlayFilters =
-        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=18:y=14:fontsize=26:fontcolor=0x8B173D@0.90:borderw=1:bordercolor=white@0.20,` +
-        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=18:y=48:fontsize=14:fontcolor=0x8B173D@0.84:borderw=1:bordercolor=white@0.18,` +
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=18:y=14:fontsize=26:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.25,` +
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=18:y=48:fontsize=14:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.20,` +
         `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=h-58:fontsize=14:fontcolor=yellow:box=1:boxcolor=black@0.42:boxborderw=5${normalOverlayEnable},` +
         `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=h-34:fontsize=17:fontcolor=white:box=1:boxcolor=black@0.42:boxborderw=6${normalOverlayEnable}`;
 
