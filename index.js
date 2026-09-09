@@ -15,7 +15,11 @@ app.use(express.json());
 // CONFIG
 // ============================================================
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav']);
-const CROSSFADE_SECONDS = Math.max(0, Math.min(8, Number(process.env.MIX_CROSSFADE_SECONDS || 3)));
+const CROSSFADE_SECONDS = Math.max(0, Math.min(8, Number(process.env.CROSSFADE_SECONDS || process.env.MIX_CROSSFADE_SECONDS || 3)));
+const SELF_HANDOVER_AFTER_MINUTES = Math.max(30, Math.min(350, Number(process.env.SELF_HANDOVER_AFTER_MINUTES || 220)));
+const GITHUB_HANDOVER_TOKEN = process.env.GITHUB_TOKEN_FOR_HANDOVER || '';
+const GITHUB_REPOSITORY_NAME = process.env.GITHUB_REPOSITORY_NAME || process.env.GITHUB_REPOSITORY || '';
+const GITHUB_REF_NAME = process.env.GITHUB_REF_NAME || 'main';
 const AD_EVERY_SONGS = Math.max(1, Math.min(50, Number(process.env.AD_EVERY_SONGS || 7)));
 const DAY_BG_START_HOUR = Math.max(0, Math.min(23, Number(process.env.DAY_BG_START_HOUR || 7)));
 const NIGHT_BG_START_HOUR = Math.max(0, Math.min(23, Number(process.env.NIGHT_BG_START_HOUR || 20)));
@@ -66,11 +70,12 @@ let ownsStreamLease = false;
 let leaseRenewTimer = null;
 let clockWriterTimer = null;
 let commandPollTimer = null;
+let successorDispatchTimer = null;
 let lastLeaseWaitLogAt = 0;
 
 let newYearQueue = [];
 let lastNewYearSequenceKey = null;
-let pendingMixMedia = null;
+let pendingCrossfadeMedia = null;
 
 let forcedNewYearTest = null;
 let forcedNewYearTestQueue = [];
@@ -281,17 +286,33 @@ function startClockOverlayWriter() {
     clockWriterTimer = setInterval(updateClockOverlayFiles, 1000);
 }
 
-function selectBackgroundFile(time = getGreekTime()) {
-    const isDay = time.hour >= DAY_BG_START_HOUR && time.hour < NIGHT_BG_START_HOUR;
-    const bases = isDay ? ['background_day', 'background_night'] : ['background_night', 'background_day'];
-    for (const base of bases) {
-        for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
-            const candidate = `${base}${ext}`;
-            if (fs.existsSync(path.join(__dirname, candidate))) return candidate;
+function selectBackgroundSpec(time = getGreekTime(), media = null) {
+    // A queued/advertising visual wins over the normal station background.
+    if (media?.visualFile) {
+        const visual = String(media.visualFile);
+        if (fs.existsSync(path.join(__dirname, visual))) {
+            return { file: visual, nightFx: false, isVisual: true };
         }
     }
-    for (const fallback of ['background.jpg','background.png']) {
-        if (fs.existsSync(path.join(__dirname, fallback))) return fallback;
+
+    const isDay = time.hour >= DAY_BG_START_HOUR && time.hour < NIGHT_BG_START_HOUR;
+    const preferred = isDay ? 'background_day' : 'background_night';
+    const fallback = isDay ? 'background_night' : 'background_day';
+
+    for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
+        const candidate = `${preferred}${ext}`;
+        if (fs.existsSync(path.join(__dirname, candidate))) return { file: candidate, nightFx: false, isVisual: false };
+    }
+
+    // V6: if no dedicated night image exists, night mode is generated live with
+    // a real colour grade instead of silently using the daytime background unchanged.
+    for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
+        const candidate = `${fallback}${ext}`;
+        if (fs.existsSync(path.join(__dirname, candidate))) return { file: candidate, nightFx: !isDay, isVisual: false };
+    }
+
+    for (const candidate of ['background.jpg','background.png']) {
+        if (fs.existsSync(path.join(__dirname, candidate))) return { file: candidate, nightFx: !isDay, isVisual: false };
     }
     return null;
 }
@@ -380,6 +401,66 @@ async function syncSongsToSupabase() {
     }
 }
 
+
+function findVisualForAudio(filename) {
+    const ext = path.extname(filename);
+    const base = path.basename(filename, ext);
+    const cleanBase = base.replace(/^\([^)]+\)\s*/, '').trim();
+    const roots = ['', 'ads', 'images', 'visuals'];
+    const names = [...new Set([base, cleanBase])];
+    for (const root of roots) {
+        for (const name of names) {
+            for (const imageExt of ['.jpg', '.jpeg', '.png', '.webp']) {
+                const rel = root ? path.join(root, `${name}${imageExt}`) : `${name}${imageExt}`;
+                if (fs.existsSync(path.join(__dirname, rel))) return rel.replace(/\\/g, '/');
+            }
+        }
+    }
+    return null;
+}
+
+async function syncMediaCatalog() {
+    if (!supabase) return;
+    try {
+        const files = fs.readdirSync(__dirname).filter(f => isAudioFile(f) && !isSystemFile(f));
+        const syncedAt = new Date().toISOString();
+        const rows = files.map(filename => ({
+            filename,
+            media_type: hasTag(filename, ...TAG.ADS) ? 'ad' : 'song',
+            tag: extractTag(filename) || null,
+            visual_file: findVisualForAudio(filename),
+            is_active: true,
+            synced_at: syncedAt
+        }));
+
+        if (rows.length) {
+            const { error } = await supabase.from('station_media').upsert(rows, { onConflict: 'filename' });
+            if (error) throw error;
+        }
+
+        const { data: dbRows, error: listError } = await supabase.from('station_media').select('filename');
+        if (listError) throw listError;
+        const local = new Set(files);
+        const stale = (dbRows || []).map(r => r.filename).filter(Boolean).filter(f => !local.has(f));
+        if (stale.length) {
+            const { error } = await supabase.from('station_media').update({ is_active: false }).in('filename', stale);
+            if (error) throw error;
+        }
+        console.log(`[MEDIA SYNC] ${rows.length} media files • songs + (ΔΦ) ads • optional visuals detected.`);
+    } catch (error) {
+        console.error('[MEDIA SYNC ERROR]', error.message);
+    }
+}
+
+async function getMediaCatalogRow(filename) {
+    if (!supabase || !filename) return null;
+    try {
+        const { data, error } = await supabase.from('station_media').select('*').eq('filename', filename).maybeSingle();
+        if (error) throw error;
+        return data || null;
+    } catch (_) { return null; }
+}
+
 async function getCategorySettings(force = false) {
     if (!supabase) return new Map();
     if (!force && Date.now() - categorySettingsCache.at < 15000) return categorySettingsCache.map;
@@ -421,13 +502,9 @@ async function markRequestSkipped(id, reason, note = null) {
     if (!supabase) return false;
     const now = new Date().toISOString();
     const { data, error } = await supabase.from('song_requests').update({
-        status: 'skipped',
-        failure_reason: reason,
-        admin_note: note,
-        decided_at: now,
-        claimed_at: null
-    }).eq('id', id).in('status', ['pending', 'checking', 'playing']).select('id');
-
+        status: 'skipped', failure_reason: reason, admin_note: note,
+        decided_at: now, claimed_at: null
+    }).eq('id', id).in('status', ['pending', 'checking', 'reserved', 'playing']).select('id');
     if (error) {
         console.error(`[REQUEST SKIP ERROR #${id}] ${error.message}`);
         return false;
@@ -444,7 +521,7 @@ async function recoverStaleRequests() {
     const staleBefore = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     const { error } = await supabase.from('song_requests').update({
         status: 'pending', claimed_at: null, decided_at: null
-    }).in('status', ['checking', 'playing']).lt('claimed_at', staleBefore);
+    }).in('status', ['checking', 'reserved', 'playing']).lt('claimed_at', staleBefore);
     if (error) console.error('[REQUEST RECOVERY ERROR]', error.message);
 }
 
@@ -457,17 +534,44 @@ async function hasPendingRequestQuick() {
     } catch (_) { return false; }
 }
 
-async function checkSupabaseRequest() {
+async function sendRequestPlayingMail(media) {
+    if (!media?.requestEmail || !process.env.EMAIL_USER || !process.env.EMAIL_PASS || media.requestMailSent) return;
+    media.requestMailSent = true;
+    transporter.sendMail({
+        to: media.requestEmail,
+        from: process.env.EMAIL_USER,
+        subject: 'Το τραγούδι σας αναμεταδίδεται! 🎵',
+        html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${media.file}" μεταδίδεται τώρα στο Thavma Παλμός.</p>`
+    }).catch(err => console.error('[EMAIL ERROR]', err.message));
+}
+
+async function activateRequestMedia(media) {
+    if (!supabase || !media?.requestId || media.requestActivated) return true;
+    const { data, error } = await supabase.from('song_requests').update({
+        status: 'playing', failure_reason: null, decided_at: new Date().toISOString()
+    }).eq('id', media.requestId).in('status', ['checking', 'reserved']).select('id');
+    if (error) {
+        console.error(`[REQUEST PLAY ERROR #${media.requestId}]`, error.message);
+        return false;
+    }
+    if (!data?.length) return false;
+    media.requestActivated = true;
+    await sendRequestPlayingMail(media);
+    return true;
+}
+
+async function rollbackReservedRequest(media) {
+    if (!supabase || !media?.requestId || media.requestActivated) return;
+    await supabase.from('song_requests').update({ status: 'pending', claimed_at: null, decided_at: null })
+        .eq('id', media.requestId).eq('status', 'reserved');
+}
+
+async function checkSupabaseRequest({ reserveOnly = false } = {}) {
     if (!supabase) return null;
     try {
-        const { data, error } = await supabase
-            .from('song_requests')
-            .select('*')
-            .eq('status', 'pending')
-            .order('created_at', { ascending: true })
-            .limit(25);
-
-        if (error || !data || data.length === 0) return null;
+        const { data, error } = await supabase.from('song_requests').select('*')
+            .eq('status', 'pending').order('created_at', { ascending: true }).limit(25);
+        if (error || !data?.length) return null;
 
         const files = fs.readdirSync(__dirname);
         const fileMap = new Map(files.filter(isAudioFile).map(f => [f.toLowerCase(), f]));
@@ -476,84 +580,144 @@ async function checkSupabaseRequest() {
         const time = getGreekTime();
 
         for (const request of data) {
-            // Claim first. A bad request can therefore never be examined hundreds of times.
             const claimedAt = new Date().toISOString();
-            const { data: claimRows, error: claimError } = await supabase
-                .from('song_requests')
-                .update({ status: 'checking', claimed_at: claimedAt, failure_reason: null })
-                .eq('id', request.id)
-                .eq('status', 'pending')
-                .select('*');
-
-            if (claimError) {
-                console.error(`[REQUEST CLAIM ERROR #${request.id}] ${claimError.message}`);
-                continue;
-            }
+            const { data: claimRows, error: claimError } = await supabase.from('song_requests')
+                .update({ status: reserveOnly ? 'reserved' : 'checking', claimed_at: claimedAt, failure_reason: null })
+                .eq('id', request.id).eq('status', 'pending').select('*');
+            if (claimError) { console.error(`[REQUEST CLAIM ERROR #${request.id}] ${claimError.message}`); continue; }
             if (!claimRows?.length) continue;
-            
+
             const claimedRequest = claimRows[0];
-            const targetSongFile = claimedRequest.song || ''; 
-            const category = extractTag(targetSongFile) || claimedRequest.category || '';
+            const category = extractTag(claimedRequest.song) || claimedRequest.category || '';
             const categoryRow = categorySettings.get(category);
-            const songRow = songSettings.get(targetSongFile);
-            
+            const songRow = songSettings.get(claimedRequest.song);
+
             if (categoryRow?.is_locked) {
                 await markRequestSkipped(claimedRequest.id, 'category_locked', categoryRow.lock_reason || 'Η κατηγορία κλειδώθηκε από admin.');
                 continue;
             }
-
             if (category === 'X' && !isChristmasPeriod(time.month, time.date)) {
                 await markRequestSkipped(claimedRequest.id, 'out_of_season', 'Χριστουγεννιάτικο εκτός εορταστικής περιόδου.');
                 continue;
             }
-
             if (!songRow || songRow.is_requestable === false) {
                 await markRequestSkipped(claimedRequest.id, 'song_blocked', 'Το τραγούδι αφαιρέθηκε από τις παραγγελίες.');
                 continue;
             }
-
             const match = fileMap.get(String(claimedRequest.song || '').toLowerCase());
             if (!match) {
                 await markRequestSkipped(claimedRequest.id, 'not_found', 'Το αρχείο δεν υπάρχει στον ενεργό broadcaster.');
                 continue;
             }
 
-            const { data: playingRows, error: playingError } = await supabase
-                .from('song_requests')
-                .update({ status: 'playing', failure_reason: null, decided_at: new Date().toISOString() })
-                .eq('id', claimedRequest.id)
-                .eq('status', 'checking')
-                .select('id');
-
-            if (playingError) throw playingError;
-            if (!playingRows?.length) continue;
-
-            console.log(`[LIVE REQUEST #${claimedRequest.id}] ${match} από ${claimedRequest.requester}`);
-
-            if (claimedRequest.email && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-                transporter.sendMail({
-                    to: claimedRequest.email,
-                    from: process.env.EMAIL_USER,
-                    subject: 'Το τραγούδι σας αναμεταδίδεται! 🎵',
-                    html: `<h2>Γεια σας!</h2><p>Το τραγούδι "${claimedRequest.song}" μεταδίδεται τώρα στο Thavma Παλμός.</p>`
-                }).catch(err => console.error('[EMAIL ERROR]', err.message));
-            }
-
-            return {
+            const media = {
                 file: match,
                 title: cleanDisplayTitle(match),
                 genreLabel: `Παραγγελία Ακροατή [${claimedRequest.requester}]`,
-                isSong: true,
-                isRequest: true,
-                requestId: claimedRequest.id
+                isSong: true, isRequest: true,
+                requestId: claimedRequest.id,
+                requestEmail: claimedRequest.email || null,
+                requestActivated: false,
+                crossfadeEligible: true
             };
-        }
 
+            if (!reserveOnly) {
+                const ok = await activateRequestMedia(media);
+                if (!ok) continue;
+            }
+            console.log(`[LIVE REQUEST #${claimedRequest.id}] ${match} από ${claimedRequest.requester}${reserveOnly ? ' • reserved for crossfade' : ''}`);
+            return media;
+        }
         return null;
     } catch (error) {
         console.error('[REQUEST CHECK ERROR]', error.message);
         return null;
     }
+}
+
+// ============================================================
+// ADMIN MANUAL QUEUE
+// ============================================================
+async function recoverStaleQueue() {
+    if (!supabase) return;
+    const staleBefore = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const { error } = await supabase.from('station_queue').update({
+        status: 'queued', reserved_at: null, started_at: null
+    }).in('status', ['reserved', 'playing']).lt('reserved_at', staleBefore);
+    if (error) console.error('[QUEUE RECOVERY ERROR]', error.message);
+}
+
+async function activateQueueMedia(media) {
+    if (!supabase || !media?.queueId || media.queueActivated) return true;
+    const { data, error } = await supabase.from('station_queue').update({
+        status: 'playing', started_at: new Date().toISOString()
+    }).eq('id', media.queueId).eq('status', 'reserved').select('id');
+    if (error) { console.error(`[QUEUE PLAY ERROR #${media.queueId}]`, error.message); return false; }
+    if (!data?.length) return false;
+    media.queueActivated = true;
+    return true;
+}
+
+async function rollbackReservedQueue(media) {
+    if (!supabase || !media?.queueId || media.queueActivated) return;
+    await supabase.from('station_queue').update({ status: 'queued', reserved_at: null, started_at: null })
+        .eq('id', media.queueId).eq('status', 'reserved');
+}
+
+async function checkManualQueue({ reserveOnly = false } = {}) {
+    if (!supabase) return null;
+    try {
+        const { data, error } = await supabase.from('station_queue').select('*')
+            .eq('status', 'queued').order('sort_order', { ascending: true }).order('created_at', { ascending: true }).limit(10);
+        if (error || !data?.length) return null;
+        for (const row of data) {
+            const { data: claimed, error: claimError } = await supabase.from('station_queue').update({
+                status: 'reserved', reserved_at: new Date().toISOString()
+            }).eq('id', row.id).eq('status', 'queued').select('*');
+            if (claimError || !claimed?.length) continue;
+            const item = claimed[0];
+            if (!fs.existsSync(path.join(__dirname, item.filename)) || !isAudioFile(item.filename)) {
+                await supabase.from('station_queue').update({ status: 'skipped', note: 'missing_file', played_at: new Date().toISOString() }).eq('id', item.id);
+                console.log(`[QUEUE SKIP #${item.id}] missing_file ${item.filename}`);
+                continue;
+            }
+            const media = {
+                file: item.filename,
+                title: cleanDisplayTitle(item.filename),
+                genreLabel: item.media_type === 'ad' ? 'Διαφημιστικό Διάλειμμα' : 'Επιλογή Διαχειριστή',
+                isSong: item.media_type !== 'ad',
+                isAd: item.media_type === 'ad',
+                isManualQueue: true,
+                queueId: item.id,
+                queueActivated: false,
+                visualFile: item.visual_file || findVisualForAudio(item.filename),
+                crossfadeEligible: true
+            };
+            if (!reserveOnly) {
+                const ok = await activateQueueMedia(media);
+                if (!ok) continue;
+            }
+            console.log(`[ADMIN QUEUE #${item.id}] ${item.filename}${reserveOnly ? ' • reserved for crossfade' : ''}`);
+            return media;
+        }
+        return null;
+    } catch (error) {
+        console.error('[QUEUE ERROR]', error.message);
+        return null;
+    }
+}
+
+async function rollbackReservedMedia(media) {
+    if (!media) return;
+    await rollbackReservedRequest(media);
+    await rollbackReservedQueue(media);
+}
+
+async function activateReservedMedia(media) {
+    if (!media) return true;
+    if (media.requestId && !(await activateRequestMedia(media))) return false;
+    if (media.queueId && !(await activateQueueMedia(media))) return false;
+    return true;
 }
 
 // ============================================================
@@ -657,7 +821,7 @@ async function beginForcedNewYearTest(commandId, source = 'admin') {
     if (forcedNewYearTest) return;
     forcedNewYearTest = { commandId, source, phase: 'countdown_pending' };
     forcedNewYearTestQueue = [];
-    pendingMixMedia = null;
+    if (pendingCrossfadeMedia) { await restorePendingCrossfadeAfterAbort(pendingCrossfadeMedia); pendingCrossfadeMedia = null; }
     console.log(`[NEW YEAR TEST] Ενεργοποιήθηκε από ${source}.`);
 
     if (currentFfmpegProcess) {
@@ -714,12 +878,16 @@ async function selectAutoProgramMedia() {
     const xFiles = musicFiles.filter(f => hasTag(f, ...TAG.CHRISTMAS));
     const normalPool = musicFiles.filter(f => !hasTag(f, ...TAG.CHRISTMAS));
 
-    // Ads are a separate non-requestable rotation.
     if (songsSinceAd >= AD_EVERY_SONGS && adFiles.length) {
         const ad = await claimRotationSong('ADS', adFiles);
         if (ad) {
             await logPlayHistory(ad, 'ADS', 'ad');
-            return { file: ad, title: cleanDisplayTitle(ad), genreLabel: 'Διαφημιστικό Διάλειμμα', isAd: true, rotationKey: 'ADS' };
+            const row = await getMediaCatalogRow(ad);
+            return {
+                file: ad, title: cleanDisplayTitle(ad), genreLabel: 'Διαφημιστικό Διάλειμμα',
+                isAd: true, rotationKey: 'ADS', visualFile: row?.visual_file || findVisualForAudio(ad),
+                crossfadeEligible: true
+            };
         }
     }
 
@@ -756,9 +924,7 @@ async function selectAutoProgramMedia() {
     if (isChristmasPeriod(time.month, time.date) && xFiles.length) {
         const xProb = isNewYearXBoostWindow(time.month, time.date, time.hour) ? 0.80 : 0.35;
         if (Math.random() < xProb) {
-            filtered = xFiles;
-            rotationKey = 'X';
-            genreLabel = 'Χριστουγεννιάτικο Πρόγραμμα (X)';
+            filtered = xFiles; rotationKey = 'X'; genreLabel = 'Χριστουγεννιάτικο Πρόγραμμα (X)';
         }
     }
 
@@ -767,14 +933,14 @@ async function selectAutoProgramMedia() {
     await logPlayHistory(file, rotationKey, 'auto');
     return {
         file, title: cleanDisplayTitle(file), genreLabel,
-        isSong: true, rotationKey, candidatePool: filtered
+        isSong: true, rotationKey, candidatePool: filtered,
+        crossfadeEligible: true
     };
 }
 
 async function selectNextFile() {
     const time = getGreekTime();
 
-    // Forced admin/workflow New Year test has highest priority.
     if (forcedNewYearTest) {
         if (forcedNewYearTest.phase === 'countdown_pending') {
             const file = chooseCountdownTestAudio();
@@ -783,16 +949,9 @@ async function selectNextFile() {
                 forcedNewYearTest = null;
             } else {
                 forcedNewYearTest.phase = 'countdown_running';
-                return {
-                    file,
-                    title: 'TEST ΑΝΤΙΣΤΡΟΦΗΣ ΜΕΤΡΗΣΗΣ',
-                    genreLabel: 'TEST Πρωτοχρονιάς',
-                    isSystem: true,
-                    isNewYearTestCountdown: true
-                };
+                return { file, title: 'TEST ΑΝΤΙΣΤΡΟΦΗΣ ΜΕΤΡΗΣΗΣ', genreLabel: 'TEST Πρωτοχρονιάς', isSystem: true, isNewYearTestCountdown: true, crossfadeEligible: false };
             }
         }
-
         if (forcedNewYearTest && forcedNewYearTest.phase === 'sequence') {
             if (forcedNewYearTestQueue.length) return forcedNewYearTestQueue.shift();
             await finishAdminCommand(forcedNewYearTest.commandId, 'New Year test completed');
@@ -804,21 +963,11 @@ async function selectNextFile() {
     await prepareRealNewYearSequence(time);
     if (newYearQueue.length) return newYearQueue.shift();
 
-    // A pre-crossfaded MIX song must continue from second 3.
-    if (pendingMixMedia) {
-        if (getRequiredGenre() === 'MIX') {
-            const media = pendingMixMedia;
-            pendingMixMedia = null;
-            return media;
-        }
-        pendingMixMedia = null;
-    }
-
     if (time.hour === 0 && lastAnthemDate !== time.date) {
         const anthem = findNamedAudio('ethnikos_ymnos');
         if (anthem) {
             lastAnthemDate = time.date;
-            return { file: anthem, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true };
+            return { file: anthem, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true, isAnthem: true, crossfadeEligible: false };
         }
     }
 
@@ -827,7 +976,7 @@ async function selectNextFile() {
         if (hourFile) {
             lastAnnouncedHour = time.hour;
             songCounter = 0;
-            return { file: hourFile, title: `Η ώρα είναι ${pad2(time.hour)}.00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true, isSystem: true };
+            return { file: hourFile, title: `Η ώρα είναι ${pad2(time.hour)}.00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true, isSystem: true, crossfadeEligible: false };
         }
     }
 
@@ -842,10 +991,21 @@ async function selectNextFile() {
                 file: jingle,
                 title: christmasActive && path.basename(jingle).startsWith('xmas_') ? 'Thavma Παλμός Xmas Jingle' : 'Thavma Παλμός Jingle',
                 genreLabel: christmasActive ? 'Χριστουγεννιάτικο Σήμα Σταθμού' : 'Σήμα Σταθμού',
-                isSystem: true
+                isSystem: true, isJingle: true, crossfadeEligible: false
             };
         }
     }
+
+    // The next media has already been heard for the first CROSSFADE_SECONDS in
+    // the previous ffmpeg process. Continue from that exact offset.
+    if (pendingCrossfadeMedia) {
+        const media = pendingCrossfadeMedia;
+        pendingCrossfadeMedia = null;
+        return media;
+    }
+
+    const manual = await checkManualQueue();
+    if (manual) return manual;
 
     const request = await checkSupabaseRequest();
     if (request) return request;
@@ -853,42 +1013,55 @@ async function selectNextFile() {
     return selectAutoProgramMedia();
 }
 
-async function maybePrepareMixCrossfade(media, spawnTime) {
+function crossesHourBoundary(spawnTime, remainingSeconds) {
+    if (!Number.isFinite(remainingSeconds) || remainingSeconds <= 0) return true;
+    const end = new Date(spawnTime.raw.getTime() + remainingSeconds * 1000);
+    return end.getFullYear() !== spawnTime.year || end.getMonth() !== spawnTime.month ||
+        end.getDate() !== spawnTime.date || end.getHours() !== spawnTime.hour;
+}
+
+async function selectCrossfadeNextMedia() {
+    // Manual sequencing has highest musical priority, then listener requests,
+    // then the normal automatic schedule / ads.
+    const manual = await checkManualQueue({ reserveOnly: true });
+    if (manual) return manual;
+    const request = await checkSupabaseRequest({ reserveOnly: true });
+    if (request) return request;
+    return selectAutoProgramMedia();
+}
+
+async function maybePrepareCrossfade(media, spawnTime) {
     if (CROSSFADE_SECONDS <= 0) return;
-    if (!media?.isSong || media.isRequest || media.isAd || media.isSystem) return;
-    if (media.rotationKey !== 'MIX') return;
-    if (!Array.isArray(media.candidatePool) || media.candidatePool.length < 2) return;
-    if (spawnTime.minute >= 55) return;
-    if (getRequiredGenreForDate(new Date(Date.now() + 5 * 60 * 1000)) !== 'MIX') return;
-    if (songCounter >= 5 || songsSinceAd >= AD_EVERY_SONGS) return;
-    if (await hasPendingRequestQuick()) return;
+    if (!media || media.isSystem || media.isHourAnnouncement || media.isAnthem || media.isJingle || media.isNewYearTestCountdown) return;
+    if (media.crossfadeEligible === false) return;
+    if (!isAudioFile(media.file)) return;
+    if (songCounter >= 5) return; // next item must be station jingle
     if (await hasPendingAdminCommandQuick()) return;
 
-    const currentDuration = getAudioDuration(media.file);
-    if (!currentDuration || currentDuration - Number(media.resumeOffsetSec || 0) <= CROSSFADE_SECONDS + 4) return;
+    const duration = getAudioDuration(media.file);
+    const resumeOffset = Number(media.resumeOffsetSec || 0);
+    const remaining = duration ? duration - resumeOffset : null;
+    if (!remaining || remaining <= CROSSFADE_SECONDS + 4) return;
+    if (crossesHourBoundary(spawnTime, remaining)) return; // the hour / anthem must be clean
+    if (spawnTime.month === 11 && spawnTime.date === 31 && spawnTime.hour === 23) return;
 
-    const viable = media.candidatePool.filter(f => {
-        if (f === media.file) return false;
-        const d = getAudioDuration(f);
-        return d && d > CROSSFADE_SECONDS + 4;
-    });
-    if (!viable.length) return;
+    const next = await selectCrossfadeNextMedia();
+    if (!next) return;
+    if (next.isSystem || next.isHourAnnouncement || next.isAnthem || next.isJingle) {
+        await rollbackReservedMedia(next);
+        return;
+    }
+    const nextDuration = getAudioDuration(next.file);
+    if (!nextDuration || nextDuration <= CROSSFADE_SECONDS + 2) {
+        await rollbackReservedMedia(next);
+        return;
+    }
 
-    const nextFile = await claimRotationSong('MIX', viable);
-    if (!nextFile || nextFile === media.file) return;
-
-    await logPlayHistory(nextFile, 'MIX', 'auto-crossfade-preload');
-    const nextMedia = {
-        file: nextFile,
-        title: cleanDisplayTitle(nextFile),
-        genreLabel: 'Mix Πρόγραμμα',
-        isSong: true,
-        rotationKey: 'MIX',
-        candidatePool: media.candidatePool,
-        resumeOffsetSec: CROSSFADE_SECONDS
-    };
-    media.crossfadeNext = nextMedia;
-    pendingMixMedia = nextMedia;
+    next.resumeOffsetSec = CROSSFADE_SECONDS;
+    next.wasCrossfaded = true;
+    media.crossfadeNext = next;
+    pendingCrossfadeMedia = next;
+    console.log(`[CROSSFADE] ${media.title} -> ${next.title} (${CROSSFADE_SECONDS}s)`);
 }
 
 // ============================================================
@@ -990,30 +1163,71 @@ async function updateStationStatus(title, genre) {
     if (error) console.error('[STATUS ERROR]', error.message);
 }
 
+async function restorePendingCrossfadeAfterAbort(media) {
+    if (!supabase || !media) return;
+    try {
+        if (media.requestId) {
+            await supabase.from('song_requests').update({ status: 'pending', claimed_at: null, decided_at: null })
+                .eq('id', media.requestId).in('status', ['reserved', 'playing']);
+            media.requestActivated = false;
+        }
+        if (media.queueId) {
+            await supabase.from('station_queue').update({ status: 'queued', reserved_at: null, started_at: null })
+                .eq('id', media.queueId).in('status', ['reserved', 'playing']);
+            media.queueActivated = false;
+        }
+    } catch (error) {
+        console.error('[CROSSFADE ROLLBACK ERROR]', error.message);
+    }
+}
+
+async function finalizePlayedMedia(media, code, intentional) {
+    if (!supabase || !media) return;
+    if (media.requestId) {
+        if (code === 0 && !intentional) {
+            await supabase.from('song_requests').update({ status: 'played', claimed_at: null, failure_reason: null }).eq('id', media.requestId);
+        } else if (intentional) {
+            await supabase.from('song_requests').update({ status: 'pending', claimed_at: null, decided_at: null }).eq('id', media.requestId);
+        } else {
+            await markRequestSkipped(media.requestId, 'playback_error', `FFmpeg code ${code ?? 'unknown'}`);
+        }
+    }
+    if (media.queueId) {
+        if (code === 0 && !intentional) {
+            await supabase.from('station_queue').update({ status: 'played', played_at: new Date().toISOString() }).eq('id', media.queueId);
+        } else if (intentional) {
+            await supabase.from('station_queue').update({ status: 'queued', reserved_at: null, started_at: null }).eq('id', media.queueId);
+        } else {
+            await supabase.from('station_queue').update({ status: 'skipped', note: `playback_error_${code ?? 'unknown'}`, played_at: new Date().toISOString() }).eq('id', media.queueId);
+        }
+    }
+}
+
 async function startNextMedia() {
     if (isShuttingDown || (supabase && !ownsStreamLease)) return;
 
     const media = await selectNextFile();
     const spawnTime = getGreekTime();
-    const background = selectBackgroundFile(spawnTime);
+    const bgSpec = selectBackgroundSpec(spawnTime, media);
 
-    if (!media || !background || !fs.existsSync(path.join(__dirname, media.file))) {
+    if (!media || !bgSpec || !fs.existsSync(path.join(__dirname, media.file))) {
         setTimeout(startNextMedia, 2000);
         return;
     }
 
+    if (!(await activateReservedMedia(media))) {
+        console.error('[MEDIA ACTIVATE] Η reserved εγγραφή δεν μπόρεσε να ενεργοποιηθεί. Προχωράμε παρακάτω.');
+        setTimeout(startNextMedia, 700);
+        return;
+    }
+
     currentMedia = media;
-
     if (media.isHourAnnouncement) songCounter = 0;
-    else if (media.isSong && !media.isRequest) songCounter++;
-
-    // ΠΡΟΣΘΗΚΗ: Ενημερώνει το Supabase για το τι παίζει τώρα στο site
-    await updateStationStatus(media.title, media.genreLabel);
-
+    else if (media.isSong) songCounter++;
     if (media.isAd) songsSinceAd = 0;
     else if (media.isSong) songsSinceAd++;
 
-    await maybePrepareMixCrossfade(media, spawnTime);
+    await maybePrepareCrossfade(media, spawnTime);
     await updateStationStatus(media.title, media.genreLabel);
 
     const streamKey = process.env.YOUTUBE_STREAM_KEY;
@@ -1037,20 +1251,27 @@ async function startNextMedia() {
         normalOverlayEnable = `:enable='not(between(t\\,${Math.max(0, ny.suppressNormalOverlayFrom).toFixed(2)}\\,${ny.suppressNormalOverlayUntil.toFixed(2)}))'`;
     }
 
-    // V5: time/date are two independent, always-on overlays. They are rendered AFTER blackout/countdown background filters.
+    // V6: clock/date returns to the original visual language: transparent burgundy,
+    // upper-left. Track/category move to the lower-left so they never collide.
     const baseOverlayFilters =
-        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=22:fontsize=15:fontcolor=yellow:box=1:boxcolor=black@0.55:boxborderw=6${normalOverlayEnable},` +
-        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=50:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=7${normalOverlayEnable},` +
-        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=w-tw-20:y=16:fontsize=26:fontcolor=0xFFD76A:box=1:boxcolor=black@0.72:boxborderw=10,` +
-        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=w-tw-20:y=58:fontsize=15:fontcolor=white:box=1:boxcolor=black@0.62:boxborderw=7`;
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=18:y=14:fontsize=26:fontcolor=0x8B173D@0.90:borderw=1:bordercolor=white@0.20,` +
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=18:y=48:fontsize=14:fontcolor=0x8B173D@0.84:borderw=1:bordercolor=white@0.18,` +
+        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=h-58:fontsize=14:fontcolor=yellow:box=1:boxcolor=black@0.42:boxborderw=5${normalOverlayEnable},` +
+        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=h-34:fontsize=17:fontcolor=white:box=1:boxcolor=black@0.42:boxborderw=6${normalOverlayEnable}`;
 
     const countdownChain = ny.filters.length ? ',' + ny.filters.join(',') : '';
-    const vfChain = `scale=854:480${blackoutFilter},${baseOverlayFilters}${countdownChain}`;
+    const fitBase = bgSpec.isVisual
+        ? `scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2:color=black`
+        : `scale=854:480`;
+    const nightGrade = bgSpec.nightFx
+        ? `,eq=brightness=-0.28:contrast=1.12:saturation=0.66:gamma=0.84,colorbalance=bs=.16:bm=.08:rs=-.05,vignette=PI/5`
+        : '';
+    const vfChain = `${fitBase}${nightGrade}${blackoutFilter},${baseOverlayFilters}${countdownChain}`;
 
     const args = [
         '-hide_banner', '-loglevel', 'warning',
         '-re', '-fflags', '+genpts',
-        '-loop', '1', '-framerate', '12', '-i', background
+        '-loop', '1', '-framerate', '12', '-i', bgSpec.file
     ];
 
     const resumeOffset = Number(media.resumeOffsetSec || 0);
@@ -1058,10 +1279,10 @@ async function startNextMedia() {
     args.push('-i', media.file);
 
     if (media.crossfadeNext) {
-        args.push('-t', (CROSSFADE_SECONDS + 0.25).toFixed(2), '-i', media.crossfadeNext.file);
+        args.push('-t', (CROSSFADE_SECONDS + 0.35).toFixed(2), '-i', media.crossfadeNext.file);
         const audioFilter =
             `[1:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1];` +
-            `[2:a]atrim=start=0:end=${CROSSFADE_SECONDS.toFixed(3)},aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a2];` +
+            `[2:a]atrim=start=0:end=${(CROSSFADE_SECONDS + 0.10).toFixed(3)},aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a2];` +
             `[a1][a2]acrossfade=d=${CROSSFADE_SECONDS.toFixed(3)}:c1=tri:c2=tri[aout]`;
         args.push('-filter_complex', audioFilter, '-map', '0:v:0', '-map', '[aout]');
     } else {
@@ -1077,27 +1298,26 @@ async function startNextMedia() {
     );
 
     const cutAtMidnight = secondsUntilNewYearMidnight(spawnTime);
-    if (media.isNewYearTestCountdown && ny.testEnd) {
-        args.push('-t', String(ny.testEnd));
-    } else if (cutAtMidnight !== null && cutAtMidnight > 0.25) {
-        args.push('-t', cutAtMidnight.toFixed(3));
-    }
+    if (media.isNewYearTestCountdown && ny.testEnd) args.push('-t', String(ny.testEnd));
+    else if (cutAtMidnight !== null && cutAtMidnight > 0.25) args.push('-t', cutAtMidnight.toFixed(3));
 
     args.push('-pix_fmt', 'yuv420p', '-f', 'flv', `rtmp://a.rtmp.youtube.com/live2/${streamKey}`);
 
-    console.log(`[PLAY] ${media.title} | ${media.genreLabel} | BG=${background}${media.crossfadeNext ? ` | crossfade->${media.crossfadeNext.title}` : ''}`);
+    console.log(`[PLAY] ${media.title} | ${media.genreLabel} | BG=${bgSpec.file}${bgSpec.nightFx ? ' [AUTO NIGHT]' : ''}${media.visualFile ? ' [VISUAL]' : ''}${media.crossfadeNext ? ` | crossfade->${media.crossfadeNext.title}` : ''}`);
 
     const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     currentFfmpegProcess = ffmpeg;
     let stderrTail = '';
-    ffmpeg.stderr?.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-1200); });
+    ffmpeg.stderr?.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-1600); });
 
     if (media.crossfadeNext) {
         const duration = getAudioDuration(media.file);
         if (duration) {
             const delay = Math.max(0, (duration - resumeOffset - CROSSFADE_SECONDS) * 1000);
-            currentCrossfadeTimer = setTimeout(() => {
-                updateStationStatus(media.crossfadeNext.title, 'Mix Πρόγραμμα • Crossfade').catch(() => {});
+            currentCrossfadeTimer = setTimeout(async () => {
+                const next = media.crossfadeNext;
+                const ok = await activateReservedMedia(next);
+                if (ok) await updateStationStatus(next.title, `${next.genreLabel} • Crossfade`);
             }, delay);
         }
     }
@@ -1110,31 +1330,24 @@ async function startNextMedia() {
 
         const intentional = intentionalStopReason;
         intentionalStopReason = null;
+        await finalizePlayedMedia(media, code, intentional);
 
-        if (media.requestId && supabase) {
-            if (code === 0 && !intentional) {
-                await supabase.from('song_requests').update({ status: 'played', claimed_at: null, failure_reason: null }).eq('id', media.requestId);
-            } else if (intentional) {
-                // Handover / admin test: keep the listener's request for the next broadcaster.
-                await supabase.from('song_requests').update({ status: 'pending', claimed_at: null }).eq('id', media.requestId);
-            } else {
-                // A corrupt/unplayable requested file is skipped ONCE instead of causing an endless retry loop.
-                await markRequestSkipped(media.requestId, 'playback_error', `FFmpeg code ${code ?? 'unknown'}`);
-            }
-        }
-
-        if (media.isNewYearTestCountdown && code === 0) {
+        if (media.isNewYearTestCountdown && code === 0 && !intentional) {
             forcedNewYearTestQueue = buildNewYearSpecialSequence('TEST Πρωτοχρονιάς');
             if (forcedNewYearTest) forcedNewYearTest.phase = 'sequence';
         }
 
+        if ((code !== 0 || intentional) && media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
+            await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
+            pendingCrossfadeMedia = null;
+        }
+
         if ((code && code !== 0) && !intentional && !isShuttingDown) {
-            console.error(`[FFMPEG CLOSE] ${media.file} code=${code} signal=${signal || '-'} | ${stderrTail.replace(/\s+/g, ' ').slice(-900)}`);
-            if (media.crossfadeNext) pendingMixMedia = null;
+            console.error(`[FFMPEG CLOSE] ${media.file} code=${code} signal=${signal || '-'} | ${stderrTail.replace(/\s+/g, ' ').slice(-1100)}`);
         }
 
         if (!isShuttingDown && (!supabase || ownsStreamLease)) {
-            setTimeout(startNextMedia, intentional ? 150 : (code === 0 ? 150 : 1500));
+            setTimeout(startNextMedia, intentional ? 180 : (code === 0 ? 120 : 1300));
         }
     });
 
@@ -1143,10 +1356,13 @@ async function startNextMedia() {
         currentCrossfadeTimer = null;
         currentFfmpegProcess = null;
         currentMedia = null;
-        pendingMixMedia = null;
         console.error('[FFMPEG SPAWN ERROR]', error.message);
-        if (media.requestId && supabase) await markRequestSkipped(media.requestId, 'playback_error', `FFmpeg spawn: ${error.message}`);
-        if (!isShuttingDown && (!supabase || ownsStreamLease)) setTimeout(startNextMedia, 2000);
+        await finalizePlayedMedia(media, 1, false);
+        if (media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
+            await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
+            pendingCrossfadeMedia = null;
+        }
+        if (!isShuttingDown && (!supabase || ownsStreamLease)) setTimeout(startNextMedia, 1800);
     });
 }
 
@@ -1212,6 +1428,8 @@ async function waitForLeaseAndStart() {
     while (!isShuttingDown) {
         if (await acquireStreamLease()) {
             console.log(`[LEASE] ${STREAM_OWNER_ID} έγινε ο ενεργός broadcaster.`);
+            successorDispatched = false;
+            scheduleSuccessorDispatch();
             await startHeartbeat();
             if (leaseRenewTimer) clearInterval(leaseRenewTimer);
             leaseRenewTimer = setInterval(async () => {
@@ -1231,6 +1449,66 @@ async function waitForLeaseAndStart() {
 }
 
 // ============================================================
+// GITHUB SELF-HANDOVER
+// ============================================================
+let successorDispatched = false;
+
+async function dispatchSuccessorWorkflow(reason = 'scheduled-handover') {
+    if (successorDispatched) return true;
+    if (!GITHUB_HANDOVER_TOKEN || !GITHUB_REPOSITORY_NAME) {
+        console.warn('[HANDOVER] Δεν υπάρχουν GITHUB_TOKEN_FOR_HANDOVER / repository metadata. Το watchdog workflow παραμένει fallback.');
+        return false;
+    }
+    const url = `https://api.github.com/repos/${GITHUB_REPOSITORY_NAME}/actions/workflows/live.yml/dispatches`;
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/vnd.github+json',
+                'Authorization': `Bearer ${GITHUB_HANDOVER_TOKEN}`,
+                'X-GitHub-Api-Version': '2022-11-28',
+                'Content-Type': 'application/json',
+                'User-Agent': 'Thavma-Palmos-V6'
+            },
+            body: JSON.stringify({
+                ref: GITHUB_REF_NAME,
+                inputs: { handover_from: STREAM_OWNER_ID, handover_reason: reason, test_newyear: 'false' }
+            })
+        });
+        if (!response.ok) {
+            const body = await response.text();
+            console.error(`[HANDOVER DISPATCH ERROR] HTTP ${response.status} ${body.slice(0, 500)}`);
+            return false;
+        }
+        successorDispatched = true;
+        console.log(`[HANDOVER] Νέο live.yml workflow ζητήθηκε αυτόματα (${reason}). Το νέο job θα περιμένει το lease.`);
+        return true;
+    } catch (error) {
+        console.error('[HANDOVER DISPATCH ERROR]', error.message);
+        return false;
+    }
+}
+
+async function dispatchSuccessorWithRetry(reason = 'self-handover') {
+    for (let attempt = 1; attempt <= 6 && !isShuttingDown && !successorDispatched; attempt++) {
+        const ok = await dispatchSuccessorWorkflow(reason);
+        if (ok) return true;
+        console.warn(`[HANDOVER] Αποτυχία dispatch ${attempt}/6. Νέα προσπάθεια σε 2 λεπτά.`);
+        await sleep(2 * 60 * 1000);
+    }
+    return successorDispatched;
+}
+
+function scheduleSuccessorDispatch() {
+    if (successorDispatchTimer) clearTimeout(successorDispatchTimer);
+    const delay = SELF_HANDOVER_AFTER_MINUTES * 60 * 1000;
+    successorDispatchTimer = setTimeout(() => {
+        dispatchSuccessorWithRetry('self-handover').catch(error => console.error('[HANDOVER RETRY ERROR]', error.message));
+    }, delay);
+    console.log(`[HANDOVER] successor dispatch σε ${SELF_HANDOVER_AFTER_MINUTES} λεπτά.`);
+}
+
+// ============================================================
 // SHUTDOWN / STARTUP
 // ============================================================
 async function gracefulShutdown(signal) {
@@ -1242,6 +1520,7 @@ async function gracefulShutdown(signal) {
     if (clockWriterTimer) clearInterval(clockWriterTimer);
     if (commandPollTimer) clearInterval(commandPollTimer);
     if (currentCrossfadeTimer) clearTimeout(currentCrossfadeTimer);
+    if (successorDispatchTimer) clearTimeout(successorDispatchTimer);
 
     if (currentFfmpegProcess) {
         intentionalStopReason = 'shutdown';
@@ -1256,13 +1535,15 @@ process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
 process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
 
 app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`Thavma Palmos V5 server στο port ${PORT}`);
+    console.log(`Thavma Palmos V6 server στο port ${PORT}`);
     console.log(`[STREAM OWNER] ${STREAM_OWNER_ID}`);
-    console.log(`[CONFIG] MIX crossfade=${CROSSFADE_SECONDS}s | ad every=${AD_EVERY_SONGS} songs | day=${DAY_BG_START_HOUR}:00-${NIGHT_BG_START_HOUR}:00`);
+    console.log(`[CONFIG] crossfade=${CROSSFADE_SECONDS}s (all non-system audio) | ad every=${AD_EVERY_SONGS} songs | day=${DAY_BG_START_HOUR}:00-${NIGHT_BG_START_HOUR}:00 | self-handover=${SELF_HANDOVER_AFTER_MINUTES}m`);
 
     startClockOverlayWriter();
     await syncSongsToSupabase();
+    await syncMediaCatalog();
     await recoverStaleRequests();
+    await recoverStaleQueue();
 
     commandPollTimer = setInterval(pollAdminCommands, 5000);
     if (startupNewYearTestRequested) {

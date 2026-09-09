@@ -1,15 +1,27 @@
-name: Thavma Palmos - 24/7 Live Radio V5
+name: Thavma Palmos - 24/7 Live Radio V6
 
 on:
-  schedule:
-    - cron: '0 */4 * * *'
   workflow_dispatch:
     inputs:
       test_newyear:
-        description: 'One-time test Πρωτοχρονιάς (~60 sec + special sequence)'
+        description: 'One-time TEST Πρωτοχρονιάς'
         required: false
         type: boolean
         default: false
+      handover_from:
+        description: 'Previous broadcaster run id'
+        required: false
+        type: string
+        default: ''
+      handover_reason:
+        description: 'Reason for automatic handover'
+        required: false
+        type: string
+        default: 'manual'
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   stream:
@@ -26,11 +38,11 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        run: npm install express @supabase/supabase-js nodemailer
+        run: npm install --no-audit --no-fund express @supabase/supabase-js nodemailer
 
       - name: Verify ffmpeg / ffprobe
         run: |
-          if ! command -v ffmpeg &> /dev/null; then
+          if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y ffmpeg
           fi
@@ -43,16 +55,13 @@ jobs:
             sudo apt-get update -y
             sudo apt-get install -y fonts-liberation
           fi
-
-      - name: Install custom fonts
-        run: |
           mkdir -p /usr/share/fonts/truetype/custom
           if [ -d "./fonts" ]; then
             sudo cp ./fonts/*.ttf /usr/share/fonts/truetype/custom/ 2>/dev/null || true
-            sudo fc-cache -f -v /usr/share/fonts/truetype/custom/
+            sudo fc-cache -f >/dev/null 2>&1 || true
           fi
 
-      - name: Run 24/7 radio stream V5
+      - name: Run broadcaster V6
         env:
           YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -60,8 +69,16 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           TEST_NEWYEAR: ${{ inputs.test_newyear }}
-          MIX_CROSSFADE_SECONDS: '3'
+          CROSSFADE_SECONDS: '3'
           AD_EVERY_SONGS: '7'
           DAY_BG_START_HOUR: '7'
           NIGHT_BG_START_HOUR: '20'
-        run: timeout 14460 node index.js || true
+          SELF_HANDOVER_AFTER_MINUTES: '215'
+          STREAM_OWNER_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          GITHUB_TOKEN_FOR_HANDOVER: ${{ github.token }}
+          GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "Starting V6 broadcaster. Previous=${{ inputs.handover_from }} Reason=${{ inputs.handover_reason }}"
+          timeout --signal=TERM --kill-after=15s 13800 node index.js || code=$?
+          echo "Broadcaster process ended with code ${code:-0}. Handover workflow/watchdog will verify a successor."
