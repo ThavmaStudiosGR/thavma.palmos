@@ -62,7 +62,7 @@ let currentNowPlaying = { title: 'Φορτώνει...', genre: 'Radio' };
 
 let currentFfmpegProcess = null;
 let currentMedia = null;
-let currentTimer = null;
+let currentCrossfadeTimer = null;
 let isShuttingDown = false;
 let intentionalStopReason = null;
 
@@ -75,7 +75,7 @@ let lastLeaseWaitLogAt = 0;
 
 let newYearQueue = [];
 let lastNewYearSequenceKey = null;
-let pendingMedia = null;
+let pendingCrossfadeMedia = null;
 
 let forcedNewYearTest = null;
 let forcedNewYearTestQueue = [];
@@ -618,14 +618,14 @@ async function checkSupabaseRequest({ reserveOnly = false } = {}) {
                 requestId: claimedRequest.id,
                 requestEmail: claimedRequest.email || null,
                 requestActivated: false,
-                Eligible: true
+                crossfadeEligible: true
             };
 
             if (!reserveOnly) {
                 const ok = await activateRequestMedia(media);
                 if (!ok) continue;
             }
-            console.log(`[LIVE REQUEST #${claimedRequest.id}] ${match} από ${claimedRequest.requester}${reserveOnly ? ' • reserved for ' : ''}`);
+            console.log(`[LIVE REQUEST #${claimedRequest.id}] ${match} από ${claimedRequest.requester}${reserveOnly ? ' • reserved for crossfade' : ''}`);
             return media;
         }
         return null;
@@ -691,13 +691,13 @@ async function checkManualQueue({ reserveOnly = false } = {}) {
                 queueId: item.id,
                 queueActivated: false,
                 visualFile: item.visual_file || findVisualForAudio(item.filename),
-                Eligible: true
+                crossfadeEligible: true
             };
             if (!reserveOnly) {
                 const ok = await activateQueueMedia(media);
                 if (!ok) continue;
             }
-            console.log(`[ADMIN QUEUE #${item.id}] ${item.filename}${reserveOnly ? ' • reserved for ' : ''}`);
+            console.log(`[ADMIN QUEUE #${item.id}] ${item.filename}${reserveOnly ? ' • reserved for crossfade' : ''}`);
             return media;
         }
         return null;
@@ -821,7 +821,7 @@ async function beginForcedNewYearTest(commandId, source = 'admin') {
     if (forcedNewYearTest) return;
     forcedNewYearTest = { commandId, source, phase: 'countdown_pending' };
     forcedNewYearTestQueue = [];
-    if (pendingMedia) { await restorePendingAfterAbort(pendingMedia); pendingMedia = null; }
+    if (pendingCrossfadeMedia) { await restorePendingCrossfadeAfterAbort(pendingCrossfadeMedia); pendingCrossfadeMedia = null; }
     console.log(`[NEW YEAR TEST] Ενεργοποιήθηκε από ${source}.`);
 
     if (currentFfmpegProcess) {
@@ -886,7 +886,7 @@ async function selectAutoProgramMedia() {
             return {
                 file: ad, title: cleanDisplayTitle(ad), genreLabel: 'Διαφημιστικό Διάλειμμα',
                 isAd: true, rotationKey: 'ADS', visualFile: row?.visual_file || findVisualForAudio(ad),
-                Eligible: true
+                crossfadeEligible: true
             };
         }
     }
@@ -934,7 +934,7 @@ async function selectAutoProgramMedia() {
     return {
         file, title: cleanDisplayTitle(file), genreLabel,
         isSong: true, rotationKey, candidatePool: filtered,
-        Eligible: true
+        crossfadeEligible: true
     };
 }
 
@@ -949,7 +949,7 @@ async function selectNextFile() {
                 forcedNewYearTest = null;
             } else {
                 forcedNewYearTest.phase = 'countdown_running';
-                return { file, title: 'TEST ΑΝΤΙΣΤΡΟΦΗΣ ΜΕΤΡΗΣΗΣ', genreLabel: 'TEST Πρωτοχρονιάς', isSystem: true, isNewYearTestCountdown: true, Eligible: false };
+                return { file, title: 'TEST ΑΝΤΙΣΤΡΟΦΗΣ ΜΕΤΡΗΣΗΣ', genreLabel: 'TEST Πρωτοχρονιάς', isSystem: true, isNewYearTestCountdown: true, crossfadeEligible: false };
             }
         }
         if (forcedNewYearTest && forcedNewYearTest.phase === 'sequence') {
@@ -967,7 +967,7 @@ async function selectNextFile() {
         const anthem = findNamedAudio('ethnikos_ymnos');
         if (anthem) {
             lastAnthemDate = time.date;
-            return { file: anthem, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true, isAnthem: true, Eligible: false };
+            return { file: anthem, title: 'ΕΘΝΙΚΟΣ ΥΜΝΟΣ', genreLabel: 'Ειδική Μετάδοση', isSystem: true, isAnthem: true, crossfadeEligible: false };
         }
     }
 
@@ -976,7 +976,7 @@ async function selectNextFile() {
         if (hourFile) {
             lastAnnouncedHour = time.hour;
             songCounter = 0;
-            return { file: hourFile, title: `Η ώρα είναι ${pad2(time.hour)}.00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true, isSystem: true, Eligible: false };
+            return { file: hourFile, title: `Η ώρα είναι ${pad2(time.hour)}.00`, genreLabel: 'Ώρα Ελλάδος', isHourAnnouncement: true, isSystem: true, crossfadeEligible: false };
         }
     }
 
@@ -991,16 +991,16 @@ async function selectNextFile() {
                 file: jingle,
                 title: christmasActive && path.basename(jingle).startsWith('xmas_') ? 'Thavma Παλμός Xmas Jingle' : 'Thavma Παλμός Jingle',
                 genreLabel: christmasActive ? 'Χριστουγεννιάτικο Σήμα Σταθμού' : 'Σήμα Σταθμού',
-                isSystem: true, isJingle: true, Eligible: false
+                isSystem: true, isJingle: true, crossfadeEligible: false
             };
         }
     }
 
-    // The next media has already been heard for the first _SECONDS in
+    // The next media has already been heard for the first CROSSFADE_SECONDS in
     // the previous ffmpeg process. Continue from that exact offset.
-    if (pendingMedia) {
-        const media = pendingMedia;
-        pendingMedia = null;
+    if (pendingCrossfadeMedia) {
+        const media = pendingCrossfadeMedia;
+        pendingCrossfadeMedia = null;
         return media;
     }
 
@@ -1020,7 +1020,7 @@ function crossesHourBoundary(spawnTime, remainingSeconds) {
         end.getDate() !== spawnTime.date || end.getHours() !== spawnTime.hour;
 }
 
-async function selectNextMedia() {
+async function selectCrossfadeNextMedia() {
     // Manual sequencing has highest musical priority, then listener requests,
     // then the normal automatic schedule / ads.
     const manual = await checkManualQueue({ reserveOnly: true });
@@ -1030,8 +1030,8 @@ async function selectNextMedia() {
     return selectAutoProgramMedia();
 }
 
-async function maybePrepare(media, spawnTime) {
-    if (_SECONDS <= 0) return;
+async function maybePrepareCrossfade(media, spawnTime) {
+    if (CROSSFADE_SECONDS <= 0) return;
     if (!media || media.isSystem || media.isHourAnnouncement || media.isAnthem || media.isJingle || media.isNewYearTestCountdown) return;
     if (media.crossfadeEligible === false) return;
     if (!isAudioFile(media.file)) return;
