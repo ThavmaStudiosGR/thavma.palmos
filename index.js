@@ -15,7 +15,7 @@ app.use(express.json());
 // CONFIG
 // ============================================================
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav']);
-const CROSSFADE_SECONDS = Math.max(0, Math.min(8, Number(process.env.CROSSFADE_SECONDS || process.env.MIX_CROSSFADE_SECONDS || 5)));
+const CROSSFADE_SECONDS = Math.max(0, Math.min(8, Number(process.env.CROSSFADE_SECONDS || process.env.MIX_CROSSFADE_SECONDS || 3)));
 const SELF_HANDOVER_AFTER_MINUTES = Math.max(30, Math.min(350, Number(process.env.SELF_HANDOVER_AFTER_MINUTES || 220)));
 const GITHUB_HANDOVER_TOKEN = process.env.GITHUB_TOKEN_FOR_HANDOVER || '';
 const GITHUB_REPOSITORY_NAME = process.env.GITHUB_REPOSITORY_NAME || process.env.GITHUB_REPOSITORY || '';
