@@ -193,20 +193,23 @@ function getRequiredGenreForDate(date) {
     if (isEasterPeriod(t)) return 'EASTER_MODE';
     if (d === 0 || d === 6) return 'MIX';
 
+    // Δευτέρα, Τετάρτη, Παρασκευή
     if (d === 1 || d === 3 || d === 5) {
-        if (h >= 2 && h < 7) return 'B';
-        if (h >= 7 && h < 12) return 'R';
-        if (h >= 12 && h < 17) return 'P_LZ';
-        if (h >= 17 && h < 20) return 'R';
-        return 'MIX';
+        if (h >= 21 || h < 2) return 'B';
+        if (h >= 2 && h < 7) return 'MIX';
+        if (h >= 7 && h < 13) return 'R';
+        if (h >= 13 && h < 16) return 'P_LZ';
+        return 'R'; // 16:00 - 21:00
     }
 
+    // Τρίτη, Πέμπτη
     if (d === 2 || d === 4) {
-        if (h >= 2 && h < 8) return 'B';
-        if (h >= 8 && h < 12) return 'R';
-        if (h >= 12 && h < 16) return 'P_LZ';
-        if (h >= 16 && h < 20) return 'R';
-        return 'MIX';
+        if (h < 7) return 'MIX';
+        if (h >= 7 && h < 13) return 'R';
+        if (h >= 13 && h < 15) return 'P';
+        if (h >= 15 && h < 16) return 'LZ';
+        if (h >= 16 && h < 21) return 'R';
+        return 'B'; // 21:00 - 00:00
     }
 
     return 'MIX';
@@ -684,7 +687,7 @@ async function checkManualQueue({ reserveOnly = false } = {}) {
             const media = {
                 file: item.filename,
                 title: cleanDisplayTitle(item.filename),
-                genreLabel: item.media_type === 'ad' ? 'Διαφημιστικό Διάλειμμα' : 'Επιλογή Διαχειριστή',
+                genreLabel: item.media_type === 'ad' ? 'Διαφημιστικό Διάλειμμα' : 'Mix',
                 isSong: item.media_type !== 'ad',
                 isAd: item.media_type === 'ad',
                 isManualQueue: true,
@@ -732,20 +735,68 @@ async function getRecentPlayedFilenames(limit = 5) {
     } catch (_) { return []; }
 }
 
+// Fallback μνήμης αν το Supabase δεν απαντά.
+const memoryCycle = new Map();
+
+// Κύκλος ανά κατηγορία: κανένα τραγούδι δεν ξαναπαίζει μέχρι να παιχτούν
+// όλα τα τραγούδια της κατηγορίας. Η κατάσταση υπολογίζεται από το
+// play_history στο Supabase, άρα επιβιώνει των restarts του workflow.
 async function claimRotationSong(rotationKey, candidates) {
-    const unique = [...new Set((candidates || []).filter(Boolean))];
-    if (!unique.length) return null;
+    const pool = [...new Set((candidates || []).filter(Boolean))];
+    if (!pool.length) return null;
+    const inPool = new Set(pool);
+
+    let played = new Set();
+    let lastPlayed = null;
+    let loaded = false;
+
     if (supabase) {
-        const recent = await getRecentPlayedFilenames(5);
-        const { data, error } = await supabase.rpc('claim_rotation_song', {
-            p_rotation_key: rotationKey,
-            p_candidates: unique,
-            p_recent: recent
-        });
-        if (!error && data) return data;
-        if (error) console.error(`[ROTATION ERROR ${rotationKey}]`, error.message);
+        try {
+            const { data, error } = await supabase.from('play_history')
+                .select('filename')
+                .eq('rotation_key', rotationKey)
+                .order('played_at', { ascending: false })
+                .limit(Math.max(1000, pool.length * 3));
+            if (error) throw error;
+
+            // Επανάληψη της ιστορίας από το παλιότερο στο νεότερο
+            for (const row of (data || []).reverse()) {
+                const f = row.filename;
+                if (!inPool.has(f)) continue;
+                if (played.has(f)) played = new Set();            // επανάληψη => νέος κύκλος
+                played.add(f);
+                lastPlayed = f;
+                if (played.size >= pool.length) played = new Set(); // ο κύκλος ολοκληρώθηκε
+            }
+            loaded = true;
+        } catch (error) {
+            console.error(`[ROTATION ERROR ${rotationKey}]`, error.message);
+        }
     }
-    return shuffleArray([...unique])[0] || null;
+
+    if (!loaded) {
+        const mem = memoryCycle.get(rotationKey) || { played: new Set(), last: null };
+        played = new Set([...mem.played].filter(f => inPool.has(f)));
+        lastPlayed = mem.last;
+    }
+
+    let remaining = pool.filter(f => !played.has(f));
+    if (!remaining.length) remaining = pool;
+    if (!played.size && pool.length > 1 && lastPlayed) {
+        // Μόλις ξεκινά νέος κύκλος: να μην παίξει αμέσως το ίδιο τραγούδι
+        remaining = remaining.filter(f => f !== lastPlayed);
+    }
+
+    const pick = shuffleArray([...remaining])[0] || null;
+
+    if (!loaded && pick) {
+        const mem = memoryCycle.get(rotationKey) || { played: new Set(), last: null };
+        mem.played.add(pick);
+        if (mem.played.size >= pool.length) mem.played = new Set();
+        mem.last = pick;
+        memoryCycle.set(rotationKey, mem);
+    }
+    return pick;
 }
 
 async function logPlayHistory(filename, rotationKey = null, source = 'auto') {
@@ -894,7 +945,7 @@ async function selectAutoProgramMedia() {
     let genre = getRequiredGenre();
     let filtered = [];
     let rotationKey = 'MIX';
-    let genreLabel = 'Mix Πρόγραμμα';
+    let genreLabel = 'Mix';
 
     if (genre === 'B') {
         filtered = normalPool.filter(f => hasTag(f, ...TAG.BEATS));
@@ -904,7 +955,13 @@ async function selectAutoProgramMedia() {
         rotationKey = 'R'; genreLabel = 'Radio (Κανονική Ροή)';
     } else if (genre === 'P_LZ') {
         filtered = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
-        rotationKey = 'P_LZ'; genreLabel = 'Παραδοσιακά & Λαϊκά';
+        rotationKey = 'P_LZ'; genreLabel = 'Παραδοσιακά & Ζεϊμπέκικα-Λαϊκά';
+    } else if (genre === 'P') {
+        filtered = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA));
+        rotationKey = 'P'; genreLabel = 'Παραδοσιακά';
+    } else if (genre === 'LZ') {
+        filtered = normalPool.filter(f => hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
+        rotationKey = 'LZ'; genreLabel = 'Ζεϊμπέκικα-Λαϊκά';
     } else if (genre === 'EASTER_MODE') {
         const easter = normalPool.filter(f => hasTag(f, ...TAG.PARADOSIAKA) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
         if (easter.length && Math.random() < 0.20) {
@@ -913,12 +970,12 @@ async function selectAutoProgramMedia() {
             filtered = normalPool; rotationKey = 'MIX'; genreLabel = 'Πασχαλινό Πρόγραμμα (Mix)';
         }
     } else {
-        filtered = normalPool; rotationKey = 'MIX'; genreLabel = 'Mix Πρόγραμμα';
+        filtered = normalPool; rotationKey = 'MIX'; genreLabel = 'Mix';
     }
 
     if (!filtered.length) {
         filtered = normalPool.length ? normalPool : musicFiles;
-        rotationKey = 'MIX'; genreLabel = 'Mix Πρόγραμμα';
+        rotationKey = 'MIX'; genreLabel = 'Mix';
     }
 
     if (isChristmasPeriod(time.month, time.date) && xFiles.length) {
@@ -1253,11 +1310,12 @@ async function startNextMedia() {
 
     // V6: clock/date returns to the original visual language: transparent burgundy,
     // upper-left. Track/category move to the lower-left so they never collide.
+    // Track/category: no semi-transparent box, black outline instead.
     const baseOverlayFilters =
         `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=18:y=14:fontsize=26:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.25,` +
         `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=18:y=48:fontsize=14:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.20,` +
-        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=h-58:fontsize=14:fontcolor=yellow:box=1:boxcolor=black@0.42:boxborderw=5${normalOverlayEnable},` +
-        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=h-34:fontsize=17:fontcolor=white:box=1:boxcolor=black@0.42:boxborderw=6${normalOverlayEnable}`;
+        `drawtext=fontfile='${CATEGORY_FONT}':text='${cleanLabel}':x=18:y=h-58:fontsize=14:fontcolor=yellow:borderw=2:bordercolor=black${normalOverlayEnable},` +
+        `drawtext=fontfile='${TITLE_FONT}':text='${cleanTitle}':x=18:y=h-34:fontsize=17:fontcolor=white:borderw=2:bordercolor=black${normalOverlayEnable}`;
 
     const countdownChain = ny.filters.length ? ',' + ny.filters.join(',') : '';
     const fitBase = bgSpec.isVisual
@@ -1271,15 +1329,16 @@ async function startNextMedia() {
     const args = [
         '-hide_banner', '-loglevel', 'warning',
         '-re', '-fflags', '+genpts',
+        '-thread_queue_size', '1024',
         '-loop', '1', '-framerate', '12', '-i', bgSpec.file
     ];
 
     const resumeOffset = Number(media.resumeOffsetSec || 0);
     if (resumeOffset > 0) args.push('-ss', resumeOffset.toFixed(3));
-    args.push('-i', media.file);
+    args.push('-thread_queue_size', '1024', '-i', media.file);
 
     if (media.crossfadeNext) {
-        args.push('-t', (CROSSFADE_SECONDS + 0.35).toFixed(2), '-i', media.crossfadeNext.file);
+        args.push('-t', (CROSSFADE_SECONDS + 0.35).toFixed(2), '-thread_queue_size', '1024', '-i', media.crossfadeNext.file);
         const audioFilter =
             `[1:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1];` +
             `[2:a]atrim=start=0:end=${(CROSSFADE_SECONDS + 0.10).toFixed(3)},aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a2];` +
@@ -1290,7 +1349,7 @@ async function startNextMedia() {
     }
 
     args.push(
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
         '-vf', vfChain,
         '-r', '12', '-g', '24', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
         '-c:a', 'aac', '-b:a', '192k',
