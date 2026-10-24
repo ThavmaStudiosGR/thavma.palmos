@@ -21,13 +21,33 @@ const GITHUB_HANDOVER_TOKEN = process.env.GITHUB_TOKEN_FOR_HANDOVER || '';
 const GITHUB_REPOSITORY_NAME = process.env.GITHUB_REPOSITORY_NAME || process.env.GITHUB_REPOSITORY || '';
 const GITHUB_REF_NAME = process.env.GITHUB_REF_NAME || 'main';
 const AD_EVERY_SONGS = Math.max(1, Math.min(50, Number(process.env.AD_EVERY_SONGS || 7)));
-const DAY_BG_START_HOUR = Math.max(0, Math.min(23, Number(process.env.DAY_BG_START_HOUR || 7)));
-const NIGHT_BG_START_HOUR = Math.max(0, Math.min(23, Number(process.env.NIGHT_BG_START_HOUR || 20)));
+// Φόντο ημέρας/νύχτας: ανατολή/δύση ηλίου στην Ελλάδα (προεπιλογή Αθήνα).
+const SUN_LAT = Number(process.env.SUN_LAT || 37.9838);
+const SUN_LON = Number(process.env.SUN_LON || 23.7275);
+const SUN_OFFSET_MINUTES = Number(process.env.SUN_OFFSET_MINUTES || 0); // + = αργότερα και στα δύο
+// Χριστουγεννιάτικα: 1 στα 4 τραγούδια, εκτός 22:00-08:00
+const XMAS_EVERY_SONGS = Math.max(2, Math.min(20, Number(process.env.XMAS_EVERY_SONGS || 4)));
+const XMAS_QUIET_START_HOUR = 22;
+const XMAS_QUIET_END_HOUR = 8;
+// Anti-stall
+const SUPABASE_TIMEOUT_MS = Math.max(3000, Number(process.env.SUPABASE_TIMEOUT_MS || 12000));
+const FFMPEG_STALL_SECONDS = Math.max(10, Number(process.env.FFMPEG_STALL_SECONDS || 25));
+const FFMPEG_START_GRACE_SECONDS = 40;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+
+// Κάθε κλήση προς Supabase έχει timeout, ώστε ένα "κρεμασμένο" request να μη
+// μπλοκάρει ποτέ την αλυσίδα των τραγουδιών (κύρια αιτία του "κολλήματος").
+function fetchWithTimeout(url, options = {}) {
+    const timeoutSignal = AbortSignal.timeout(SUPABASE_TIMEOUT_MS);
+    const signal = options.signal && AbortSignal.any ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+    return fetch(url, { ...options, signal });
+}
+
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false }
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { fetch: fetchWithTimeout }
 }) : null;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -58,6 +78,11 @@ let lastAnnouncedHour = getGreekTime().hour;
 let lastAnthemDate = getGreekTime().date;
 let songCounter = 0;
 let songsSinceAd = 0;
+let songsSinceXmas = 0;
+let isStartingMedia = false;
+let lastChainActivityAt = Date.now();
+let chainWatchdogTimer = null;
+let leaseErrorStreak = 0;
 let currentNowPlaying = { title: 'Φορτώνει...', genre: 'Radio' };
 
 let currentFfmpegProcess = null;
@@ -94,17 +119,69 @@ const CLOCK_DATE_FILE = path.join(__dirname, '.live_date.txt');
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function pad2(n) { return String(n).padStart(2, '0'); }
 
+// Ώρα Ελλάδος μέσω Intl (Europe/Athens): η αλλαγή θερινής/χειμερινής ώρας
+// (τελευταία Κυριακή Μαρτίου / Οκτωβρίου) γίνεται αυτόματα, χωρίς εξάρτηση από
+// το timezone του μηχανήματος.
+const ATHENS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Athens', hourCycle: 'h23',
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', second: 'numeric', weekday: 'short'
+});
+const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
 function getGreekTime(date = new Date()) {
+    const p = {};
+    for (const part of ATHENS_FORMATTER.formatToParts(date)) p[part.type] = part.value;
     return {
         raw: date,
-        year: date.getFullYear(),
-        month: date.getMonth(),
-        date: date.getDate(),
-        day: date.getDay(),
-        hour: date.getHours(),
-        minute: date.getMinutes(),
-        second: date.getSeconds()
+        year: Number(p.year),
+        month: Number(p.month) - 1,
+        date: Number(p.day),
+        day: WEEKDAY_INDEX[p.weekday] ?? 0,
+        hour: Number(p.hour) % 24,
+        minute: Number(p.minute),
+        second: Number(p.second)
     };
+}
+
+// Στιγμή (Date) για συγκεκριμένη "τοίχου" ώρα Αθήνας, με σωστό DST.
+function athensWallToDate(year, month, day, hour, minute, second) {
+    const wanted = Date.UTC(year, month, day, hour, minute, second);
+    let guess = wanted;
+    for (let i = 0; i < 3; i++) {
+        const t = getGreekTime(new Date(guess));
+        const wall = Date.UTC(t.year, t.month, t.date, t.hour, t.minute, t.second);
+        const diff = wanted - wall;
+        if (diff === 0) break;
+        guess += diff;
+    }
+    return new Date(guess);
+}
+
+// Ανατολή/δύση ηλίου (NOAA) για την ημερομηνία Αθήνας του time. Επιστρέφει απόλυτες στιγμές.
+function getSunTimes(time = getGreekTime()) {
+    const rad = Math.PI / 180;
+    const startOfYear = Date.UTC(time.year, 0, 0);
+    const doy = Math.round((Date.UTC(time.year, time.month, time.date) - startOfYear) / 86400000);
+    const g = (2 * Math.PI / 365) * (doy - 1 + (12 - 12) / 24);
+    const eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(g) - 0.032077 * Math.sin(g) - 0.014615 * Math.cos(2 * g) - 0.040849 * Math.sin(2 * g));
+    const decl = 0.006918 - 0.399912 * Math.cos(g) + 0.070257 * Math.sin(g) - 0.006758 * Math.cos(2 * g) + 0.000907 * Math.sin(2 * g) - 0.002697 * Math.cos(3 * g) + 0.00148 * Math.sin(3 * g);
+    const latR = SUN_LAT * rad;
+    let cosHa = Math.cos(90.833 * rad) / (Math.cos(latR) * Math.cos(decl)) - Math.tan(latR) * Math.tan(decl);
+    cosHa = Math.max(-1, Math.min(1, cosHa));
+    const haDeg = Math.acos(cosHa) / rad;
+    const midnightUtc = Date.UTC(time.year, time.month, time.date);
+    const offsetMs = SUN_OFFSET_MINUTES * 60000;
+    return {
+        sunrise: new Date(midnightUtc + (720 - 4 * (SUN_LON + haDeg) - eqTime) * 60000 + offsetMs),
+        sunset: new Date(midnightUtc + (720 - 4 * (SUN_LON - haDeg) - eqTime) * 60000 + offsetMs)
+    };
+}
+
+function isDaytimeGreece(time = getGreekTime()) {
+    const { sunrise, sunset } = getSunTimes(time);
+    const now = time.raw.getTime();
+    return now >= sunrise.getTime() && now < sunset.getTime();
 }
 
 function isAudioFile(fileName) {
@@ -157,7 +234,13 @@ function findHourFile(hour) {
 }
 
 function isChristmasPeriod(month, date) {
-    return (month === 10 && date >= 18) || month === 11 || month === 0;
+    // 17 Νοεμβρίου - 31 Ιανουαρίου
+    return (month === 10 && date >= 17) || month === 11 || month === 0;
+}
+
+// Ζώνη Χριστουγεννιάτικων: παντού εκτός 22:00-08:00
+function isXmasSongWindow(time) {
+    return isChristmasPeriod(time.month, time.date) && time.hour >= XMAS_QUIET_END_HOUR && time.hour < XMAS_QUIET_START_HOUR;
 }
 
 function getOrthodoxEasterDate(year) {
@@ -191,7 +274,7 @@ function getRequiredGenreForDate(date) {
     const h = t.hour;
 
     if (isEasterPeriod(t)) return 'EASTER_MODE';
-    if (d === 0 || d === 6) return 'MIX';
+    if (d === 0 || d === 6) return 'WEEKEND_MIX'; // Mix μόνο από B, R, ΛΖ
 
     // Δευτέρα, Τετάρτη, Παρασκευή
     if (d === 1 || d === 3 || d === 5) {
@@ -298,7 +381,7 @@ function selectBackgroundSpec(time = getGreekTime(), media = null) {
         }
     }
 
-    const isDay = time.hour >= DAY_BG_START_HOUR && time.hour < NIGHT_BG_START_HOUR;
+    const isDay = isDaytimeGreece(time); // ανατολή → δύση ηλίου Ελλάδος
     const preferred = isDay ? 'background_day' : 'background_night';
     const fallback = isDay ? 'background_night' : 'background_day';
 
@@ -969,6 +1052,10 @@ async function selectAutoProgramMedia() {
         } else {
             filtered = normalPool; rotationKey = 'MIX'; genreLabel = 'Πασχαλινό Πρόγραμμα (Mix)';
         }
+    } else if (genre === 'WEEKEND_MIX') {
+        // Σαββατοκύριακο: Mix μόνο από Beat (B), Radio (R) και Λαϊκά-Ζεϊμπέκικα (ΛΖ)
+        filtered = normalPool.filter(f => hasTag(f, ...TAG.BEATS) || hasTag(f, ...TAG.RADIO) || hasTag(f, ...TAG.LAIKA_ZEIMBEKIKA));
+        rotationKey = 'WMIX'; genreLabel = 'Mix';
     } else {
         filtered = normalPool; rotationKey = 'MIX'; genreLabel = 'Mix';
     }
@@ -978,11 +1065,9 @@ async function selectAutoProgramMedia() {
         rotationKey = 'MIX'; genreLabel = 'Mix';
     }
 
-    if (isChristmasPeriod(time.month, time.date) && xFiles.length) {
-        const xProb = isNewYearXBoostWindow(time.month, time.date, time.hour) ? 0.80 : 0.35;
-        if (Math.random() < xProb) {
-            filtered = xFiles; rotationKey = 'X'; genreLabel = 'Χριστουγεννιάτικο Πρόγραμμα (X)';
-        }
+    // 17/11 - 31/1, εκτός 22:00-08:00: 1 Χριστουγεννιάτικο ανά 4 τραγούδια άλλου είδους.
+    if (isXmasSongWindow(time) && xFiles.length && songsSinceXmas >= XMAS_EVERY_SONGS) {
+        filtered = xFiles; rotationKey = 'X'; genreLabel = 'Χριστουγεννιάτικο Πρόγραμμα (X)';
     }
 
     const file = await claimRotationSong(rotationKey, filtered);
@@ -1072,9 +1157,9 @@ async function selectNextFile() {
 
 function crossesHourBoundary(spawnTime, remainingSeconds) {
     if (!Number.isFinite(remainingSeconds) || remainingSeconds <= 0) return true;
-    const end = new Date(spawnTime.raw.getTime() + remainingSeconds * 1000);
-    return end.getFullYear() !== spawnTime.year || end.getMonth() !== spawnTime.month ||
-        end.getDate() !== spawnTime.date || end.getHours() !== spawnTime.hour;
+    const end = getGreekTime(new Date(spawnTime.raw.getTime() + remainingSeconds * 1000));
+    return end.year !== spawnTime.year || end.month !== spawnTime.month ||
+        end.date !== spawnTime.date || end.hour !== spawnTime.hour;
 }
 
 async function selectCrossfadeNextMedia() {
@@ -1125,10 +1210,8 @@ async function maybePrepareCrossfade(media, spawnTime) {
 // COUNTDOWN VIDEO FILTERS
 // ============================================================
 function athensTargetDate(spawnTime, daysFromNow, hour, minute, second) {
-    const target = new Date(spawnTime.raw);
-    target.setDate(target.getDate() + daysFromNow);
-    target.setHours(hour, minute, second, 0);
-    return target;
+    const day = new Date(Date.UTC(spawnTime.year, spawnTime.month, spawnTime.date + daysFromNow));
+    return athensWallToDate(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour, minute, second);
 }
 function secondsFromNowTo(spawnTime, targetDate) { return (targetDate - spawnTime.raw) / 1000; }
 
@@ -1213,11 +1296,15 @@ function secondsUntilNewYearMidnight(spawnTime) {
 async function updateStationStatus(title, genre) {
     currentNowPlaying = { title, genre };
     if (!supabase) return;
-    const now = new Date().toISOString();
-    const { error } = await supabase.from('station_status').upsert({
-        id: 1, title, genre, updated_at: now, heartbeat_at: now, stream_owner: STREAM_OWNER_ID
-    });
-    if (error) console.error('[STATUS ERROR]', error.message);
+    try {
+        const now = new Date().toISOString();
+        const { error } = await supabase.from('station_status').upsert({
+            id: 1, title, genre, updated_at: now, heartbeat_at: now, stream_owner: STREAM_OWNER_ID
+        });
+        if (error) console.error('[STATUS ERROR]', error.message);
+    } catch (e) {
+        console.error('[STATUS ERROR]', e.message);
+    }
 }
 
 async function restorePendingCrossfadeAfterAbort(media) {
@@ -1260,9 +1347,40 @@ async function finalizePlayedMedia(media, code, intentional) {
     }
 }
 
+// Wrapper: ό,τι σφάλμα κι αν συμβεί (Supabase, δίκτυο, ffprobe κ.λπ.) η αλυσίδα
+// ΔΕΝ πεθαίνει ποτέ, ξαναδοκιμάζει μετά από λίγο.
 async function startNextMedia() {
     if (isShuttingDown || (supabase && !ownsStreamLease)) return;
+    if (isStartingMedia || currentFfmpegProcess) return;
+    isStartingMedia = true;
+    lastChainActivityAt = Date.now();
+    try {
+        await startNextMediaInner();
+    } catch (error) {
+        console.error('[START MEDIA ERROR]', error && error.stack ? error.stack : error);
+        if (!isShuttingDown && (!supabase || ownsStreamLease)) setTimeout(startNextMedia, 3000);
+    } finally {
+        isStartingMedia = false;
+        lastChainActivityAt = Date.now();
+    }
+}
 
+// Εποπτεία: αν δεν παίζει τίποτα και η αλυσίδα έχει "σωπάσει", την ξαναξεκινά.
+function startChainWatchdog() {
+    if (chainWatchdogTimer) clearInterval(chainWatchdogTimer);
+    chainWatchdogTimer = setInterval(() => {
+        if (isShuttingDown || (supabase && !ownsStreamLease)) return;
+        if (currentFfmpegProcess) { lastChainActivityAt = Date.now(); return; }
+        if (Date.now() - lastChainActivityAt > 45000) {
+            console.error('[WATCHDOG] Δεν παίζει τίποτα για >45s. Επανεκκίνηση αλυσίδας.');
+            isStartingMedia = false;
+            lastChainActivityAt = Date.now();
+            startNextMedia();
+        }
+    }, 10000);
+}
+
+async function startNextMediaInner() {
     const media = await selectNextFile();
     const spawnTime = getGreekTime();
     const bgSpec = selectBackgroundSpec(spawnTime, media);
@@ -1283,6 +1401,11 @@ async function startNextMedia() {
     else if (media.isSong) songCounter++;
     if (media.isAd) songsSinceAd = 0;
     else if (media.isSong) songsSinceAd++;
+    if (media.isSong) {
+        if (media.rotationKey === 'X') songsSinceXmas = 0;
+        else if (isXmasSongWindow(spawnTime)) songsSinceXmas++;
+        else songsSinceXmas = 0; // εκτός ζώνης: ο μετρητής ξεκινά από το 0
+    }
 
     await maybePrepareCrossfade(media, spawnTime);
     await updateStationStatus(media.title, media.genreLabel);
@@ -1326,8 +1449,11 @@ async function startNextMedia() {
         : '';
     const vfChain = `${fitBase}${nightGrade}${blackoutFilter},${baseOverlayFilters}${countdownChain}`;
 
+    // Αν κάποια παλιά (κολλημένη) προσπάθεια είχε ήδη ξεκινήσει encoder, μην ξεκινήσεις δεύτερο.
+    if (currentFfmpegProcess) return;
+
     const args = [
-        '-hide_banner', '-loglevel', 'warning',
+        '-hide_banner', '-loglevel', 'warning', '-nostats', '-progress', 'pipe:1',
         '-re', '-fflags', '+genpts',
         '-thread_queue_size', '1024',
         '-loop', '1', '-framerate', '12', '-i', bgSpec.file
@@ -1364,64 +1490,112 @@ async function startNextMedia() {
 
     console.log(`[PLAY] ${media.title} | ${media.genreLabel} | BG=${bgSpec.file}${bgSpec.nightFx ? ' [AUTO NIGHT]' : ''}${media.visualFile ? ' [VISUAL]' : ''}${media.crossfadeNext ? ` | crossfade->${media.crossfadeNext.title}` : ''}`);
 
-    const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     currentFfmpegProcess = ffmpeg;
+    lastChainActivityAt = Date.now();
     let stderrTail = '';
     ffmpeg.stderr?.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-1600); });
 
+    // Anti-stall: το -progress στέλνει στατιστικά κάθε ~0.5s. Αν σταματήσουν,
+    // ο encoder είναι κολλημένος -> τον σκοτώνουμε και προχωράμε στο επόμενο.
+    const startedAt = Date.now();
+    let lastProgressAt = 0;
+    ffmpeg.stdout?.on('data', () => { lastProgressAt = Date.now(); });
+    const trackDuration = getAudioDuration(media.file);
+    const maxRuntimeMs = trackDuration ? (trackDuration + 90) * 1000 : null;
+    const stallTimer = setInterval(() => {
+        if (currentFfmpegProcess !== ffmpeg) return;
+        const now = Date.now();
+        const stalled = lastProgressAt
+            ? (now - lastProgressAt) > FFMPEG_STALL_SECONDS * 1000
+            : (now - startedAt) > FFMPEG_START_GRACE_SECONDS * 1000;
+        const overran = maxRuntimeMs !== null && (now - startedAt) > maxRuntimeMs;
+        if (stalled || overran) {
+            console.error(`[STALL] ffmpeg κόλλησε (${stalled ? 'χωρίς progress' : 'υπέρβαση διάρκειας'}) στο "${media.title}". Επανεκκίνηση.`);
+            intentionalStopReason = 'stall';
+            try { ffmpeg.kill('SIGKILL'); } catch (_) {}
+        }
+    }, 5000);
+
     if (media.crossfadeNext) {
-        const duration = getAudioDuration(media.file);
+        const duration = trackDuration;
         if (duration) {
             const delay = Math.max(0, (duration - resumeOffset - CROSSFADE_SECONDS) * 1000);
             currentCrossfadeTimer = setTimeout(async () => {
-                const next = media.crossfadeNext;
-                const ok = await activateReservedMedia(next);
-                if (ok) await updateStationStatus(next.title, `${next.genreLabel} • Crossfade`);
+                try {
+                    const next = media.crossfadeNext;
+                    const ok = await activateReservedMedia(next);
+                    if (ok) await updateStationStatus(next.title, `${next.genreLabel} • Crossfade`);
+                } catch (error) {
+                    console.error('[CROSSFADE TIMER ERROR]', error.message);
+                }
             }, delay);
         }
     }
 
+    let finished = false;
+
     ffmpeg.on('close', async (code, signal) => {
+        if (finished) return;
+        finished = true;
+        clearInterval(stallTimer);
         if (currentCrossfadeTimer) clearTimeout(currentCrossfadeTimer);
         currentCrossfadeTimer = null;
         currentFfmpegProcess = null;
         currentMedia = null;
+        lastChainActivityAt = Date.now();
 
         const intentional = intentionalStopReason;
         intentionalStopReason = null;
-        await finalizePlayedMedia(media, code, intentional);
 
-        if (media.isNewYearTestCountdown && code === 0 && !intentional) {
-            forcedNewYearTestQueue = buildNewYearSpecialSequence('TEST Πρωτοχρονιάς');
-            if (forcedNewYearTest) forcedNewYearTest.phase = 'sequence';
-        }
+        try {
+            await finalizePlayedMedia(media, code, intentional);
 
-        if ((code !== 0 || intentional) && media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
-            await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
-            pendingCrossfadeMedia = null;
-        }
+            if (media.isNewYearTestCountdown && code === 0 && !intentional) {
+                forcedNewYearTestQueue = buildNewYearSpecialSequence('TEST Πρωτοχρονιάς');
+                if (forcedNewYearTest) forcedNewYearTest.phase = 'sequence';
+            }
 
-        if ((code && code !== 0) && !intentional && !isShuttingDown) {
-            console.error(`[FFMPEG CLOSE] ${media.file} code=${code} signal=${signal || '-'} | ${stderrTail.replace(/\s+/g, ' ').slice(-1100)}`);
-        }
+            if ((code !== 0 || intentional) && media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
+                await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
+                pendingCrossfadeMedia = null;
+            }
 
-        if (!isShuttingDown && (!supabase || ownsStreamLease)) {
-            setTimeout(startNextMedia, intentional ? 180 : (code === 0 ? 120 : 1300));
+            if ((code && code !== 0) && !intentional && !isShuttingDown) {
+                console.error(`[FFMPEG CLOSE] ${media.file} code=${code} signal=${signal || '-'} | ${stderrTail.replace(/\s+/g, ' ').slice(-1100)}`);
+            }
+        } catch (error) {
+            console.error('[FFMPEG CLOSE HANDLER ERROR]', error.message);
+            if (pendingCrossfadeMedia && pendingCrossfadeMedia === media.crossfadeNext) pendingCrossfadeMedia = null;
+        } finally {
+            // Ό,τι κι αν έγινε παραπάνω, το επόμενο τραγούδι ΠΑΝΤΑ προγραμματίζεται.
+            if (!isShuttingDown && (!supabase || ownsStreamLease)) {
+                setTimeout(startNextMedia, intentional ? 180 : (code === 0 ? 120 : 1300));
+            }
         }
     });
 
     ffmpeg.on('error', async error => {
+        if (finished) return;
+        finished = true;
+        clearInterval(stallTimer);
         if (currentCrossfadeTimer) clearTimeout(currentCrossfadeTimer);
         currentCrossfadeTimer = null;
         currentFfmpegProcess = null;
         currentMedia = null;
+        lastChainActivityAt = Date.now();
         console.error('[FFMPEG SPAWN ERROR]', error.message);
-        await finalizePlayedMedia(media, 1, false);
-        if (media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
-            await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
-            pendingCrossfadeMedia = null;
+        try {
+            await finalizePlayedMedia(media, 1, false);
+            if (media.crossfadeNext && pendingCrossfadeMedia === media.crossfadeNext) {
+                await restorePendingCrossfadeAfterAbort(media.crossfadeNext);
+                pendingCrossfadeMedia = null;
+            }
+        } catch (e) {
+            console.error('[FFMPEG ERROR HANDLER ERROR]', e.message);
+        } finally {
+            if (!isShuttingDown && (!supabase || ownsStreamLease)) setTimeout(startNextMedia, 1800);
         }
-        if (!isShuttingDown && (!supabase || ownsStreamLease)) setTimeout(startNextMedia, 1800);
     });
 }
 
@@ -1430,9 +1604,12 @@ async function startNextMedia() {
 // ============================================================
 async function acquireStreamLease() {
     if (!supabase) return true;
-    const { data, error } = await supabase.rpc('acquire_stream_lease', { p_owner_id: STREAM_OWNER_ID, p_lease_seconds: STREAM_LEASE_SECONDS });
+    let data, error;
+    try {
+        ({ data, error } = await supabase.rpc('acquire_stream_lease', { p_owner_id: STREAM_OWNER_ID, p_lease_seconds: STREAM_LEASE_SECONDS }));
+    } catch (e) { error = e; }
     if (error) {
-        console.error('[LEASE ERROR]', error.message);
+        console.error('[LEASE ERROR]', error.message || error);
         return false;
     }
     ownsStreamLease = data === true;
@@ -1441,9 +1618,24 @@ async function acquireStreamLease() {
 
 async function renewStreamLease() {
     if (!supabase || !ownsStreamLease || isShuttingDown) return;
-    const { data, error } = await supabase.rpc('renew_stream_lease', { p_owner_id: STREAM_OWNER_ID, p_lease_seconds: STREAM_LEASE_SECONDS });
+    let data = null, error = null;
+    try {
+        ({ data, error } = await supabase.rpc('renew_stream_lease', { p_owner_id: STREAM_OWNER_ID, p_lease_seconds: STREAM_LEASE_SECONDS }));
+    } catch (e) { error = e; }
+
+    // Προσωρινό σφάλμα δικτύου/timeout ΔΕΝ σημαίνει χαμένο lease: το lease κρατά 90s
+    // και ανανεώνεται ανά 30s, άρα αντέχουμε 2 αποτυχίες χωρίς να κόψουμε τη μετάδοση.
+    if (error) {
+        leaseErrorStreak++;
+        console.error(`[LEASE RENEW ERROR ${leaseErrorStreak}/3]`, error.message || error);
+        if (leaseErrorStreak < 3) return;
+    } else {
+        leaseErrorStreak = 0;
+    }
+
     if (error || data !== true) {
         console.error('[LEASE LOST] Χάθηκε το lease. Σταματά ο encoder.');
+        leaseErrorStreak = 0;
         ownsStreamLease = false;
         if (currentFfmpegProcess) {
             intentionalStopReason = 'lease_lost';
@@ -1463,9 +1655,13 @@ async function releaseStreamLease() {
 
 async function startHeartbeat() {
     if (!supabase || !ownsStreamLease || isShuttingDown) return;
-    const now = new Date().toISOString();
-    const { error } = await supabase.from('station_status').upsert({ id: 1, heartbeat_at: now, stream_owner: STREAM_OWNER_ID, updated_at: now });
-    if (error) console.error('[HEARTBEAT ERROR]', error.message);
+    try {
+        const now = new Date().toISOString();
+        const { error } = await supabase.from('station_status').upsert({ id: 1, heartbeat_at: now, stream_owner: STREAM_OWNER_ID, updated_at: now });
+        if (error) console.error('[HEARTBEAT ERROR]', error.message);
+    } catch (e) {
+        console.error('[HEARTBEAT ERROR]', e.message);
+    }
 }
 
 async function logLeaseHolder() {
@@ -1480,6 +1676,7 @@ async function logLeaseHolder() {
 async function waitForLeaseAndStart() {
     if (!supabase) {
         console.warn('[LEASE] Supabase unavailable. Start without distributed lock.');
+        startChainWatchdog();
         startNextMedia();
         return;
     }
@@ -1492,9 +1689,14 @@ async function waitForLeaseAndStart() {
             await startHeartbeat();
             if (leaseRenewTimer) clearInterval(leaseRenewTimer);
             leaseRenewTimer = setInterval(async () => {
-                await renewStreamLease();
-                if (ownsStreamLease) await startHeartbeat();
+                try {
+                    await renewStreamLease();
+                    if (ownsStreamLease) await startHeartbeat();
+                } catch (e) {
+                    console.error('[LEASE TIMER ERROR]', e.message);
+                }
             }, 30000);
+            startChainWatchdog();
             startNextMedia();
             return;
         }
@@ -1529,6 +1731,7 @@ async function dispatchSuccessorWorkflow(reason = 'scheduled-handover') {
                 'Content-Type': 'application/json',
                 'User-Agent': 'Thavma-Palmos-V6'
             },
+            signal: AbortSignal.timeout(20000),
             body: JSON.stringify({
                 ref: GITHUB_REF_NAME,
                 inputs: { handover_from: STREAM_OWNER_ID, handover_reason: reason, test_newyear: 'false' }
@@ -1576,6 +1779,7 @@ async function gracefulShutdown(signal) {
     console.log(`[SHUTDOWN] ${signal} — τερματισμός encoder και release lease.`);
 
     if (leaseRenewTimer) clearInterval(leaseRenewTimer);
+    if (chainWatchdogTimer) clearInterval(chainWatchdogTimer);
     if (clockWriterTimer) clearInterval(clockWriterTimer);
     if (commandPollTimer) clearInterval(commandPollTimer);
     if (currentCrossfadeTimer) clearTimeout(currentCrossfadeTimer);
@@ -1590,21 +1794,25 @@ async function gracefulShutdown(signal) {
     setTimeout(() => process.exit(0), 1200);
 }
 
+// Κανένα απρόβλεπτο σφάλμα δεν πρέπει να ρίχνει ή να παγώνει τον broadcaster.
+process.on('uncaughtException', error => { console.error('[UNCAUGHT EXCEPTION]', error && error.stack ? error.stack : error); });
+process.on('unhandledRejection', reason => { console.error('[UNHANDLED REJECTION]', reason && reason.stack ? reason.stack : reason); });
+
 process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
 process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Thavma Palmos V6 server στο port ${PORT}`);
     console.log(`[STREAM OWNER] ${STREAM_OWNER_ID}`);
-    console.log(`[CONFIG] crossfade=${CROSSFADE_SECONDS}s (all non-system audio) | ad every=${AD_EVERY_SONGS} songs | day=${DAY_BG_START_HOUR}:00-${NIGHT_BG_START_HOUR}:00 | self-handover=${SELF_HANDOVER_AFTER_MINUTES}m`);
+    console.log(`[CONFIG] crossfade=${CROSSFADE_SECONDS}s (all non-system audio) | ad every=${AD_EVERY_SONGS} songs | bg=sunrise/sunset Ελλάδας | xmas=1/${XMAS_EVERY_SONGS} | self-handover=${SELF_HANDOVER_AFTER_MINUTES}m`);
 
     startClockOverlayWriter();
-    await syncSongsToSupabase();
-    await syncMediaCatalog();
-    await recoverStaleRequests();
-    await recoverStaleQueue();
+    // Κάθε βήμα εκκίνησης προστατεύεται: αν αποτύχει ένα, η μετάδοση ξεκινά έτσι κι αλλιώς.
+    for (const step of [syncSongsToSupabase, syncMediaCatalog, recoverStaleRequests, recoverStaleQueue]) {
+        try { await step(); } catch (e) { console.error(`[STARTUP ${step.name} ERROR]`, e.message); }
+    }
 
-    commandPollTimer = setInterval(pollAdminCommands, 5000);
+    commandPollTimer = setInterval(() => { pollAdminCommands().catch(e => console.error('[ADMIN POLL ERROR]', e.message)); }, 5000);
     if (startupNewYearTestRequested) {
         startupNewYearTestRequested = false;
         await beginForcedNewYearTest(null, 'GitHub workflow test');
