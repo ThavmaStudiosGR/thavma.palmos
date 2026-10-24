@@ -1456,7 +1456,7 @@ async function startNextMediaInner() {
         '-hide_banner', '-loglevel', 'warning', '-nostats', '-progress', 'pipe:1',
         '-re', '-fflags', '+genpts',
         '-thread_queue_size', '1024',
-        '-loop', '1', '-framerate', '12', '-i', bgSpec.file
+        '-loop', '1', '-framerate', '15', '-i', bgSpec.file
     ];
 
     const resumeOffset = Number(media.resumeOffsetSec || 0);
@@ -1475,10 +1475,13 @@ async function startNextMediaInner() {
     }
 
     args.push(
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
         '-vf', vfChain,
-        '-r', '12', '-g', '24', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
-        '-c:a', 'aac', '-b:a', '192k',
+        // Σταθερό (CBR) bitrate + keyframe ανά 2s: ομαλότερη παραλαβή από το YouTube, λιγότερα "κολλήματα".
+        '-r', '15', '-g', '30', '-keyint_min', '30', '-sc_threshold', '0',
+        '-b:v', '1500k', '-minrate', '1500k', '-maxrate', '1500k', '-bufsize', '1500k',
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2',
         '-max_muxing_queue_size', '4096', '-shortest'
     );
 
@@ -1500,12 +1503,27 @@ async function startNextMediaInner() {
     // ο encoder είναι κολλημένος -> τον σκοτώνουμε και προχωράμε στο επόμενο.
     const startedAt = Date.now();
     let lastProgressAt = 0;
-    ffmpeg.stdout?.on('data', () => { lastProgressAt = Date.now(); });
+    let perf = { speed: null, drop: 0, dup: 0 };
+    ffmpeg.stdout?.on('data', chunk => {
+        lastProgressAt = Date.now();
+        const text = chunk.toString();
+        const sp = text.match(/speed=\s*([\d.]+)x/g);
+        if (sp) perf.speed = parseFloat(sp[sp.length - 1].replace(/[^\d.]/g, ''));
+        const dr = text.match(/drop_frames=(\d+)/g);
+        if (dr) perf.drop = Number(dr[dr.length - 1].split('=')[1]);
+        const du = text.match(/dup_frames=(\d+)/g);
+        if (du) perf.dup = Number(du[du.length - 1].split('=')[1]);
+    });
+    let perfTick = 0;
     const trackDuration = getAudioDuration(media.file);
     const maxRuntimeMs = trackDuration ? (trackDuration + 90) * 1000 : null;
     const stallTimer = setInterval(() => {
         if (currentFfmpegProcess !== ffmpeg) return;
         const now = Date.now();
+        // Διάγνωση: αν ο encoder δεν προλαβαίνει (speed<0.97) ή χάνει frames, γράφεται στο log.
+        if (++perfTick % 6 === 0 && perf.speed !== null && (perf.speed < 0.97 || perf.drop > 0)) {
+            console.warn(`[PERF] speed=${perf.speed}x drop_frames=${perf.drop} dup_frames=${perf.dup} | ${media.title}`);
+        }
         const stalled = lastProgressAt
             ? (now - lastProgressAt) > FFMPEG_STALL_SECONDS * 1000
             : (now - startedAt) > FFMPEG_START_GRACE_SECONDS * 1000;
