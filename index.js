@@ -7,6 +7,13 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
 
+const ATHENS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Athens', hourCycle: 'h23',
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', second: 'numeric', weekday: 'short'
+});
+const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
@@ -122,13 +129,6 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 // Ώρα Ελλάδος μέσω Intl (Europe/Athens): η αλλαγή θερινής/χειμερινής ώρας
 // (τελευταία Κυριακή Μαρτίου / Οκτωβρίου) γίνεται αυτόματα, χωρίς εξάρτηση από
 // το timezone του μηχανήματος.
-const ATHENS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/Athens', hourCycle: 'h23',
-    year: 'numeric', month: 'numeric', day: 'numeric',
-    hour: 'numeric', minute: 'numeric', second: 'numeric', weekday: 'short'
-});
-const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-
 function getGreekTime(date = new Date()) {
     const p = {};
     for (const part of ATHENS_FORMATTER.formatToParts(date)) p[part.type] = part.value;
