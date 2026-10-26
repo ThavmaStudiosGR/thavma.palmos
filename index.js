@@ -7,6 +7,10 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
 
+// Όταν επιλέγουμε το επόμενο τραγούδι νωρίτερα (lookahead), οι αποφάσεις ώρας/προγράμματος
+// υπολογίζονται για τη στιγμή που θα ακουστεί, όχι για τώρα.
+let virtualLeadMs = 0;
+
 const ATHENS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/Athens', hourCycle: 'h23',
     year: 'numeric', month: 'numeric', day: 'numeric',
@@ -129,7 +133,7 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 // Ώρα Ελλάδος μέσω Intl (Europe/Athens): η αλλαγή θερινής/χειμερινής ώρας
 // (τελευταία Κυριακή Μαρτίου / Οκτωβρίου) γίνεται αυτόματα, χωρίς εξάρτηση από
 // το timezone του μηχανήματος.
-function getGreekTime(date = new Date()) {
+function getGreekTime(date = new Date(Date.now() + virtualLeadMs)) {
     const p = {};
     for (const part of ATHENS_FORMATTER.formatToParts(date)) p[part.type] = part.value;
     return {
@@ -298,7 +302,7 @@ function getRequiredGenreForDate(date) {
     return 'MIX';
 }
 
-function getRequiredGenre() { return getRequiredGenreForDate(new Date()); }
+function getRequiredGenre() { return getRequiredGenreForDate(new Date(Date.now() + virtualLeadMs)); }
 
 function shuffleArray(arr) {
     for (let i = arr.length - 1; i > 0; i--) {
@@ -354,7 +358,7 @@ function atomicWriteTextFile(target, text) {
 }
 
 function updateClockOverlayFiles() {
-    const t = getGreekTime();
+    const t = getGreekTime(new Date());
     const timeText = `${pad2(t.hour)}:${pad2(t.minute)}:${pad2(t.second)}`;
     const dateText = `${GREEK_WEEKDAYS[t.day]}  ${pad2(t.date)}/${pad2(t.month + 1)}/${t.year}`;
     try {
@@ -1351,7 +1355,9 @@ async function finalizePlayedMedia(media, code, intentional) {
 // ΔΕΝ πεθαίνει ποτέ, ξαναδοκιμάζει μετά από λίγο.
 async function startNextMedia() {
     if (isShuttingDown || (supabase && !ownsStreamLease)) return;
-    if (isStartingMedia || currentFfmpegProcess) return;
+    if (currentFfmpegProcess) return;
+    if (PERSISTENT_ENCODER) { await enginePump(); return; }
+    if (isStartingMedia) return;
     isStartingMedia = true;
     lastChainActivityAt = Date.now();
     try {
@@ -1370,7 +1376,8 @@ function startChainWatchdog() {
     if (chainWatchdogTimer) clearInterval(chainWatchdogTimer);
     chainWatchdogTimer = setInterval(() => {
         if (isShuttingDown || (supabase && !ownsStreamLease)) return;
-        if (currentFfmpegProcess) { lastChainActivityAt = Date.now(); return; }
+        if (currentFfmpegProcess || enc) { lastChainActivityAt = Date.now(); return; }
+        if (enginePumping && Date.now() - enginePumpStartedAt > 60000) { enginePumping = false; }
         if (Date.now() - lastChainActivityAt > 45000) {
             console.error('[WATCHDOG] Δεν παίζει τίποτα για >45s. Επανεκκίνηση αλυσίδας.');
             isStartingMedia = false;
@@ -1380,8 +1387,8 @@ function startChainWatchdog() {
     }, 10000);
 }
 
-async function startNextMediaInner() {
-    const media = await selectNextFile();
+async function startNextMediaInner(preselected = null) {
+    const media = preselected || await selectNextFile();
     const spawnTime = getGreekTime();
     const bgSpec = selectBackgroundSpec(spawnTime, media);
 
@@ -1456,7 +1463,7 @@ async function startNextMediaInner() {
         '-hide_banner', '-loglevel', 'warning', '-nostats', '-progress', 'pipe:1',
         '-re', '-fflags', '+genpts',
         '-thread_queue_size', '1024',
-        '-loop', '1', '-framerate', '12', '-i', bgSpec.file
+        '-loop', '1', '-framerate', '15', '-i', bgSpec.file
     ];
 
     const resumeOffset = Number(media.resumeOffsetSec || 0);
@@ -1475,10 +1482,13 @@ async function startNextMediaInner() {
     }
 
     args.push(
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
         '-vf', vfChain,
-        '-r', '12', '-g', '24', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k',
-        '-c:a', 'aac', '-b:a', '192k',
+        // Σταθερό (CBR) bitrate + keyframe ανά 2s: ομαλότερη παραλαβή από το YouTube, λιγότερα "κολλήματα".
+        '-r', '15', '-g', '30', '-keyint_min', '30', '-sc_threshold', '0',
+        '-b:v', '1500k', '-minrate', '1500k', '-maxrate', '1500k', '-bufsize', '1500k',
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2',
         '-max_muxing_queue_size', '4096', '-shortest'
     );
 
@@ -1500,12 +1510,27 @@ async function startNextMediaInner() {
     // ο encoder είναι κολλημένος -> τον σκοτώνουμε και προχωράμε στο επόμενο.
     const startedAt = Date.now();
     let lastProgressAt = 0;
-    ffmpeg.stdout?.on('data', () => { lastProgressAt = Date.now(); });
+    let perf = { speed: null, drop: 0, dup: 0 };
+    ffmpeg.stdout?.on('data', chunk => {
+        lastProgressAt = Date.now();
+        const text = chunk.toString();
+        const sp = text.match(/speed=\s*([\d.]+)x/g);
+        if (sp) perf.speed = parseFloat(sp[sp.length - 1].replace(/[^\d.]/g, ''));
+        const dr = text.match(/drop_frames=(\d+)/g);
+        if (dr) perf.drop = Number(dr[dr.length - 1].split('=')[1]);
+        const du = text.match(/dup_frames=(\d+)/g);
+        if (du) perf.dup = Number(du[du.length - 1].split('=')[1]);
+    });
+    let perfTick = 0;
     const trackDuration = getAudioDuration(media.file);
     const maxRuntimeMs = trackDuration ? (trackDuration + 90) * 1000 : null;
     const stallTimer = setInterval(() => {
         if (currentFfmpegProcess !== ffmpeg) return;
         const now = Date.now();
+        // Διάγνωση: αν ο encoder δεν προλαβαίνει (speed<0.97) ή χάνει frames, γράφεται στο log.
+        if (++perfTick % 6 === 0 && perf.speed !== null && (perf.speed < 0.97 || perf.drop > 0)) {
+            console.warn(`[PERF] speed=${perf.speed}x drop_frames=${perf.drop} dup_frames=${perf.dup} | ${media.title}`);
+        }
         const stalled = lastProgressAt
             ? (now - lastProgressAt) > FFMPEG_STALL_SECONDS * 1000
             : (now - startedAt) > FFMPEG_START_GRACE_SECONDS * 1000;
@@ -1600,6 +1625,359 @@ async function startNextMediaInner() {
 }
 
 // ============================================================
+// PERSISTENT ENCODER — ΜΙΑ σύνδεση προς YouTube, χωρίς reconnect σε κάθε τραγούδι
+// ============================================================
+// Ένας ffmpeg (encoder) μένει συνεχώς ανοιχτός και παίρνει PCM ήχο από stdin.
+// Κάθε τραγούδι αποκωδικοποιείται από ξεχωριστό, μικρό ffmpeg (decoder) και ο ήχος
+// του μπαίνει στην ουρά. Ο τίτλος/κατηγορία αλλάζουν μέσω αρχείων (drawtext reload),
+// άρα δεν υπάρχει πια "πάγωμα" στην αλλαγή τραγουδιού. Ειδικές περιπτώσεις
+// (εικόνα διαφήμισης, αντίστροφη μέτρηση Πρωτοχρονιάς) περνούν από το παλιό
+// per-song ffmpeg, και αλλαγή φόντου ημέρας/νύχτας κάνει ένα ελεγχόμενο restart.
+const PERSISTENT_ENCODER = process.env.PERSISTENT_ENCODER !== 'false';
+const PCM_BYTES_PER_SEC = 44100 * 4; // s16le, stereo
+const PCM_BUFFER_MAX = PCM_BYTES_PER_SEC * 12;
+const OVERLAY_LABEL_FILE = path.join(__dirname, '.live_label.txt');
+const OVERLAY_TITLE_FILE = path.join(__dirname, '.live_title.txt');
+const OUTPUT_URL_OVERRIDE = process.env.RTMP_OUTPUT_URL_OVERRIDE || '';
+
+let enc = null;              // { proc, bgFile, nightFx, graceful, ... }
+let decoder = null;          // { proc, media, sentFirst }
+let pcmQueue = [];           // { buf, media, first, last, code, announced }
+let pcmQueuedBytes = 0;
+let pcmWritten = 0;
+let pcmClockStart = 0;
+let pcmTimer = null;
+let enginePumping = false;
+let enginePumpStartedAt = 0;
+let nextPumpAllowedAt = 0;
+const engineMedia = new Set(); // media που έχουν ενεργοποιηθεί και δεν έχουν τελειώσει
+
+function writeOverlayTexts(media) {
+    try {
+        atomicWriteTextFile(OVERLAY_LABEL_FILE, String(media?.genreLabel || ''));
+        atomicWriteTextFile(OVERLAY_TITLE_FILE, String(media?.title || ''));
+    } catch (error) {
+        console.error('[OVERLAY FILE ERROR]', error.message);
+    }
+}
+
+function buildEncoderArgs(bgSpec, streamKey) {
+    const nightGrade = bgSpec.nightFx
+        ? `,eq=brightness=-0.28:contrast=1.12:saturation=0.66:gamma=0.84,colorbalance=bs=.16:bm=.08:rs=-.05,vignette=PI/5`
+        : '';
+    const vf =
+        `scale=854:480${nightGrade},` +
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_TIME_FILE}':reload=1:x=18:y=14:fontsize=26:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.25,` +
+        `drawtext=fontfile='${TIME_FONT}':textfile='${CLOCK_DATE_FILE}':reload=1:x=18:y=48:fontsize=14:fontcolor=0xFFD700@1.0:borderw=1:bordercolor=black@0.20,` +
+        `drawtext=fontfile='${CATEGORY_FONT}':textfile='${OVERLAY_LABEL_FILE}':reload=1:expansion=none:x=18:y=h-58:fontsize=14:fontcolor=yellow:borderw=2:bordercolor=black,` +
+        `drawtext=fontfile='${TITLE_FONT}':textfile='${OVERLAY_TITLE_FILE}':reload=1:expansion=none:x=18:y=h-34:fontsize=17:fontcolor=white:borderw=2:bordercolor=black`;
+    return [
+        '-hide_banner', '-loglevel', 'warning', '-nostats', '-progress', 'pipe:1',
+        '-re', '-fflags', '+genpts', '-thread_queue_size', '1024',
+        '-loop', '1', '-framerate', '15', '-i', bgSpec.file,
+        '-thread_queue_size', '1024', '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'stillimage', '-threads', '2', '-bf', '0',
+        '-vf', vf,
+        '-r', '15', '-g', '30', '-keyint_min', '30', '-sc_threshold', '0',
+        '-b:v', '1500k', '-minrate', '1500k', '-maxrate', '1500k', '-bufsize', '1500k',
+        '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+        '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2',
+        '-max_muxing_queue_size', '4096', '-shortest',
+        '-pix_fmt', 'yuv420p', '-f', 'flv',
+        OUTPUT_URL_OVERRIDE || `rtmp://a.rtmp.youtube.com/live2/${streamKey}`
+    ];
+}
+
+function startEncoder(bgSpec) {
+    const streamKey = process.env.YOUTUBE_STREAM_KEY;
+    if (!streamKey && !OUTPUT_URL_OVERRIDE) {
+        console.error('[YOUTUBE ERROR] Λείπει YOUTUBE_STREAM_KEY.');
+        return false;
+    }
+    if (!fs.existsSync(OVERLAY_LABEL_FILE)) writeOverlayTexts({ genreLabel: '', title: '' });
+
+    const proc = spawn('ffmpeg', buildEncoderArgs(bgSpec, streamKey), { stdio: ['pipe', 'pipe', 'pipe'] });
+    const e = {
+        proc, bgFile: bgSpec.file, nightFx: !!bgSpec.nightFx, graceful: false,
+        startedAt: Date.now(), lastProgressAt: 0, perf: { speed: null, drop: 0, dup: 0 }, perfTick: 0, stderrTail: '', timer: null
+    };
+    enc = e;
+    pcmQueue = []; pcmQueuedBytes = 0; pcmWritten = 0; pcmClockStart = Date.now();
+    console.log(`[ENCODER] Έναρξη μόνιμου encoder | BG=${bgSpec.file}${bgSpec.nightFx ? ' [AUTO NIGHT]' : ''}`);
+
+    proc.stdin.on('error', () => {});
+    proc.stderr.on('data', chunk => { e.stderrTail = (e.stderrTail + chunk.toString()).slice(-1600); });
+    proc.stdout.on('data', chunk => {
+        e.lastProgressAt = Date.now();
+        const text = chunk.toString();
+        const sp = text.match(/speed=\s*([\d.]+)x/g);
+        if (sp) e.perf.speed = parseFloat(sp[sp.length - 1].replace(/[^\d.]/g, ''));
+        const dr = text.match(/drop_frames=(\d+)/g);
+        if (dr) e.perf.drop = Number(dr[dr.length - 1].split('=')[1]);
+        const du = text.match(/dup_frames=(\d+)/g);
+        if (du) e.perf.dup = Number(du[du.length - 1].split('=')[1]);
+    });
+
+    e.timer = setInterval(() => {
+        if (enc !== e) return;
+        const now = Date.now();
+        if (++e.perfTick % 6 === 0 && e.perf.speed !== null && (e.perf.speed < 0.97 || e.perf.drop > 0)) {
+            console.warn(`[PERF] speed=${e.perf.speed}x drop_frames=${e.perf.drop} dup_frames=${e.perf.dup}`);
+        }
+        const stalled = e.lastProgressAt
+            ? (now - e.lastProgressAt) > FFMPEG_STALL_SECONDS * 1000
+            : (now - e.startedAt) > FFMPEG_START_GRACE_SECONDS * 1000;
+        if (stalled) {
+            console.error('[STALL] Ο μόνιμος encoder κόλλησε. Επανεκκίνηση.');
+            try { proc.kill('SIGKILL'); } catch (_) {}
+        }
+    }, 5000);
+
+    proc.on('close', async (code, signal) => {
+        clearInterval(e.timer);
+        if (enc === e) enc = null;
+        if (pcmTimer && !enc) { clearInterval(pcmTimer); pcmTimer = null; }
+        lastChainActivityAt = Date.now();
+
+        if (!e.graceful) {
+            // Απρόβλεπτος τερματισμός: καθάρισε decoder/ουρά και δώσε πίσω ό,τι δεν ακούστηκε.
+            if (decoder) { try { decoder.proc.kill('SIGKILL'); } catch (_) {} decoder = null; }
+            pcmQueue = []; pcmQueuedBytes = 0;
+            const abortedByUs = !!e.abortReason;
+            if (!abortedByUs) console.error(`[ENCODER CLOSE] code=${code} signal=${signal || '-'} | ${e.stderrTail.replace(/\s+/g, ' ').slice(-900)}`);
+            const unfinished = [...engineMedia];
+            engineMedia.clear();
+            currentMedia = null;
+            for (const m of unfinished) {
+                try { await finalizePlayedMedia(m, abortedByUs ? 0 : 1, abortedByUs || m !== unfinished[0] ? true : false); } catch (_) {}
+            }
+            try {
+                if (pendingCrossfadeMedia) { await restorePendingCrossfadeAfterAbort(pendingCrossfadeMedia); pendingCrossfadeMedia = null; }
+            } catch (_) {}
+            if (!isShuttingDown && (!supabase || ownsStreamLease) && !e.abortReason) setTimeout(startNextMedia, 1300);
+        }
+    });
+    proc.on('error', error => { console.error('[ENCODER SPAWN ERROR]', error.message); });
+
+    if (pcmTimer) clearInterval(pcmTimer);
+    pcmTimer = setInterval(pcmTick, 20);
+    return true;
+}
+
+function stopEncoderGracefully() {
+    return new Promise(resolve => {
+        const e = enc;
+        if (!e) return resolve();
+        e.graceful = true;
+        e.proc.once('close', () => resolve());
+        try { e.proc.stdin.end(); } catch (_) {}
+        setTimeout(() => { try { e.proc.kill('SIGKILL'); } catch (_) {} }, 15000);
+    });
+}
+
+function engineAbort(reason) {
+    if (enc) { enc.abortReason = reason; try { enc.proc.kill('SIGTERM'); } catch (_) {} }
+    if (decoder) { try { decoder.proc.kill('SIGKILL'); } catch (_) {} decoder = null; }
+    pcmQueue = []; pcmQueuedBytes = 0;
+}
+
+function onMediaAudible(media) {
+    currentMedia = media;
+    writeOverlayTexts(media);
+    updateStationStatus(media.title, media.genreLabel).catch(() => {});
+}
+
+function onMediaFinished(media, code) {
+    engineMedia.delete(media);
+    if (!media.announcedAudible) { /* απέτυχε πριν ακουστεί */ }
+    finalizePlayedMedia(media, code, false).catch(error => console.error('[FINALIZE ERROR]', error.message));
+    if (currentMedia === media) currentMedia = null;
+}
+
+// Ρολόι πραγματικού χρόνου: στέλνει στον encoder ακριβώς όσο ήχο αντιστοιχεί στον χρόνο
+// που πέρασε. Αν δεν υπάρχει ήχος διαθέσιμος, συμπληρώνει σιωπή (ποτέ διακοπή ροής).
+function pcmTick() {
+    const e = enc;
+    if (!e || !e.proc.stdin.writable) return;
+
+    let due = Math.floor(((Date.now() - pcmClockStart) / 1000) * PCM_BYTES_PER_SEC / 4) * 4 - pcmWritten;
+    const maxBurst = Math.floor(PCM_BYTES_PER_SEC * 0.5 / 4) * 4;
+    if (due > maxBurst) { pcmClockStart += ((due - maxBurst) / PCM_BYTES_PER_SEC) * 1000; due = maxBurst; }
+    let need = Math.max(0, due);
+
+    const out = [];
+    while (pcmQueue.length) {
+        const it = pcmQueue[0];
+        if (it.buf.length === 0) {
+            pcmQueue.shift();
+            if (it.last) {
+                if (!it.announced && it.first) onMediaAudible(it.media);
+                onMediaFinished(it.media, it.code);
+            }
+            continue;
+        }
+        if (need <= 0) break;
+        if (it.first && !it.announced) { it.announced = true; onMediaAudible(it.media); }
+        const n = Math.min(need, it.buf.length);
+        out.push(it.buf.subarray(0, n));
+        it.buf = it.buf.subarray(n);
+        pcmQueuedBytes -= n;
+        need -= n;
+        if (it.buf.length === 0) { pcmQueue.shift(); }
+    }
+    if (need > 0) out.push(Buffer.alloc(need)); // σιωπή
+
+    const total = Math.max(0, due);
+    if (total > 0) {
+        try { e.proc.stdin.write(Buffer.concat(out, total)); } catch (_) {}
+        pcmWritten += total;
+    }
+
+    if (decoder && decoder.paused && pcmQueuedBytes < PCM_BUFFER_MAX / 2) {
+        decoder.paused = false;
+        try { decoder.proc.stdout.resume(); } catch (_) {}
+    }
+    if (!decoder && !enginePumping && Date.now() >= nextPumpAllowedAt && pcmQueuedBytes < PCM_BUFFER_MAX * 0.8 && !isShuttingDown) {
+        enginePump().catch(error => console.error('[ENGINE PUMP ERROR]', error.message));
+    }
+}
+
+function buildDecoderArgs(media) {
+    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
+    const resumeOffset = Number(media.resumeOffsetSec || 0);
+    if (resumeOffset > 0) args.push('-ss', resumeOffset.toFixed(3));
+    args.push('-i', media.file);
+    if (media.crossfadeNext) {
+        args.push('-t', (CROSSFADE_SECONDS + 0.35).toFixed(2), '-i', media.crossfadeNext.file);
+        const audioFilter =
+            `[0:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1];` +
+            `[1:a]atrim=start=0:end=${(CROSSFADE_SECONDS + 0.10).toFixed(3)},aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS[a2];` +
+            `[a1][a2]acrossfade=d=${CROSSFADE_SECONDS.toFixed(3)}:c1=tri:c2=tri[aout]`;
+        args.push('-filter_complex', audioFilter, '-map', '[aout]');
+    } else {
+        args.push('-map', '0:a:0');
+    }
+    args.push('-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1');
+    return args;
+}
+
+function startDecoder(media) {
+    const proc = spawn('ffmpeg', buildDecoderArgs(media), { stdio: ['ignore', 'pipe', 'pipe'] });
+    const d = { proc, media, sentFirst: false, paused: false, stderrTail: '' };
+    decoder = d;
+    let carry = Buffer.alloc(0);
+    proc.stderr.on('data', chunk => { d.stderrTail = (d.stderrTail + chunk.toString()).slice(-800); });
+    proc.stdout.on('data', chunk => {
+        let buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+        const usable = buf.length - (buf.length % 4);
+        carry = buf.subarray(usable);
+        buf = buf.subarray(0, usable);
+        if (!buf.length) return;
+        pcmQueue.push({ buf, media, first: !d.sentFirst, last: false });
+        d.sentFirst = true;
+        pcmQueuedBytes += buf.length;
+        if (pcmQueuedBytes > PCM_BUFFER_MAX && !d.paused) { d.paused = true; proc.stdout.pause(); }
+    });
+    proc.on('close', code => {
+        if (decoder === d) decoder = null;
+        if (code !== 0) console.error(`[DECODER] ${media.file} code=${code} | ${d.stderrTail.replace(/\s+/g, ' ')}`);
+        if (enc) {
+            pcmQueue.push({ buf: Buffer.alloc(0), media, first: !d.sentFirst, last: true, code: code === 0 ? 0 : (code ?? 1) });
+        } else {
+            engineMedia.delete(media);
+        }
+        nextPumpAllowedAt = 0;
+    });
+    proc.on('error', error => console.error('[DECODER SPAWN ERROR]', error.message));
+}
+
+async function waitForPcmDrain() {
+    for (let i = 0; i < 6000 && !isShuttingDown; i++) {
+        if (!pcmQueue.length && !engineMedia.size) break;
+        await sleep(100);
+    }
+    await sleep(400); // μικρό περιθώριο για να φτάσει ο ήχος στην έξοδο
+}
+
+async function enginePump() {
+    if (isShuttingDown || (supabase && !ownsStreamLease)) return;
+    if (enginePumping || decoder || currentFfmpegProcess) return;
+    enginePumping = true; enginePumpStartedAt = Date.now(); lastChainActivityAt = Date.now();
+    try {
+        const lead = enc ? (pcmQueuedBytes / PCM_BYTES_PER_SEC) * 1000 : 0;
+        let media = null, bgSpec = null, spawnTime = null;
+        virtualLeadMs = lead;
+        try {
+            media = await selectNextFile();
+            spawnTime = getGreekTime(new Date(Date.now() + lead));
+            bgSpec = media ? selectBackgroundSpec(spawnTime, media) : null;
+        } finally { virtualLeadMs = 0; }
+
+        if (!media || !bgSpec || !fs.existsSync(path.join(__dirname, media.file))) {
+            nextPumpAllowedAt = Date.now() + 2000;
+            return;
+        }
+
+        const ny = buildNewYearCountdownFilters(spawnTime, !!media.isNewYearTestCountdown);
+        const midnightCut = secondsUntilNewYearMidnight(spawnTime);
+        const needsLegacy = !!(bgSpec.isVisual || media.isNewYearTestCountdown || ny.filters.length || midnightCut !== null);
+
+        if (needsLegacy) {
+            // Ειδική μετάδοση: μετά το τέλος του ήχου που ήδη παίζει, παίζει το παλιό per-song ffmpeg.
+            await waitForPcmDrain();
+            await stopEncoderGracefully();
+            isStartingMedia = true;
+            try { await startNextMediaInner(media); }
+            finally { isStartingMedia = false; }
+            return;
+        }
+
+        if (enc && (enc.bgFile !== bgSpec.file || enc.nightFx !== !!bgSpec.nightFx)) {
+            // Αλλαγή φόντου (ανατολή/δύση): ελεγχόμενο restart του encoder στο όριο τραγουδιού.
+            console.log(`[ENCODER] Αλλαγή φόντου → ${bgSpec.file}${bgSpec.nightFx ? ' [AUTO NIGHT]' : ''}`);
+            await waitForPcmDrain();
+            await stopEncoderGracefully();
+        }
+        if (!enc && !startEncoder(bgSpec)) {
+            await rollbackReservedMedia(media);
+            nextPumpAllowedAt = Date.now() + 5000;
+            return;
+        }
+
+        if (!(await activateReservedMedia(media))) {
+            console.error('[MEDIA ACTIVATE] Η reserved εγγραφή δεν μπόρεσε να ενεργοποιηθεί. Προχωράμε παρακάτω.');
+            nextPumpAllowedAt = Date.now() + 700;
+            return;
+        }
+
+        if (media.isHourAnnouncement) songCounter = 0;
+        else if (media.isSong) songCounter++;
+        if (media.isAd) songsSinceAd = 0;
+        else if (media.isSong) songsSinceAd++;
+        if (media.isSong) {
+            if (media.rotationKey === 'X') songsSinceXmas = 0;
+            else if (isXmasSongWindow(spawnTime)) songsSinceXmas++;
+            else songsSinceXmas = 0;
+        }
+
+        virtualLeadMs = lead;
+        try { await maybePrepareCrossfade(media, spawnTime); } finally { virtualLeadMs = 0; }
+
+        engineMedia.add(media);
+        console.log(`[PLAY] ${media.title} | ${media.genreLabel} | BG=${bgSpec.file}${bgSpec.nightFx ? ' [AUTO NIGHT]' : ''}${media.crossfadeNext ? ` | crossfade->${media.crossfadeNext.title}` : ''} | queued=${(lead / 1000).toFixed(1)}s`);
+        startDecoder(media);
+    } catch (error) {
+        console.error('[ENGINE ERROR]', error && error.stack ? error.stack : error);
+        nextPumpAllowedAt = Date.now() + 3000;
+    } finally {
+        virtualLeadMs = 0;
+        enginePumping = false;
+        lastChainActivityAt = Date.now();
+    }
+}
+
+// ============================================================
 // STREAM LEASE / HEARTBEAT
 // ============================================================
 async function acquireStreamLease() {
@@ -1641,6 +2019,7 @@ async function renewStreamLease() {
             intentionalStopReason = 'lease_lost';
             currentFfmpegProcess.kill('SIGTERM');
         }
+        engineAbort('lease_lost');
         if (leaseRenewTimer) clearInterval(leaseRenewTimer);
         leaseRenewTimer = null;
         setTimeout(() => { if (!isShuttingDown) waitForLeaseAndStart(); }, 5000);
@@ -1789,6 +2168,7 @@ async function gracefulShutdown(signal) {
         intentionalStopReason = 'shutdown';
         currentFfmpegProcess.kill('SIGTERM');
     }
+    engineAbort('shutdown');
 
     await releaseStreamLease();
     setTimeout(() => process.exit(0), 1200);
